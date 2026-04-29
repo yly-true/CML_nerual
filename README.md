@@ -10,38 +10,33 @@ This is a small PyTorch implementation of a neural extension of the Cognitive Ma
 
 The training is self-supervised from transitions `(obs, action, next_obs)` collected by random motor babbling. It does not train on rewards.
 
+Checkpoints are saved under `runs\<task>\<timestamp>\` as `model_100.pt`, `model_200.pt`, ...
+
 ## Install
 
 MuJoCo requires a working Gymnasium MuJoCo installation.
 
-```bash
+```powershell
 python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 ```
 
 ## Train
 
-```bash
-python train_cml_inverted_pendulum.py \
-  --env-id InvertedPendulum-v4 \
-  --total-env-steps 50000 \
-  --updates 20000 \
-  --device cuda
+```powershell
+python train_cml_inverted_pendulum.py --env-id InvertedPendulum-v4 --total-env-steps 50000 --updates 10000 --device cuda
 ```
 
 If your Gymnasium version uses `InvertedPendulum-v5`, pass `--env-id InvertedPendulum-v5`.
 
-The script writes checkpoints to `runs/cml_inverted_pendulum/`.
+The script writes checkpoints to `runs\<task>\<timestamp>\`.
+For example: `runs\InvertedPendulum_v4\20260429_144020\model_100.pt`.
 
 ## Evaluate
 
-```bash
-python evaluate.py \
-  --checkpoint runs/cml_inverted_pendulum/model.pt \
-  --env-id InvertedPendulum-v4 \
-  --episodes 5 \
-  --render
+```powershell
+python evaluate.py --checkpoint runs\InvertedPendulum_v4\20260429_171228\model_10000.pt --env-id InvertedPendulum-v4 --episodes 5 --device cuda --render
 ```
 
 ## Notes
