@@ -153,7 +153,7 @@ def prepare_dataset(args: argparse.Namespace):
     buffer = ReplayBuffer(obs_dim, action_dim, args.buffer_size)
     collect_random_data(env, buffer, args.total_env_steps, args.seed)
 
-    use_normalize = False
+    use_normalize = True
     if use_normalize:
         obs_mean_t, obs_std_t = compute_obs_stats(buffer.obs[: buffer.size])
         print(f"Observation mean: {obs_mean_t}")

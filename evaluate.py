@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import time
 from types import SimpleNamespace
 
@@ -20,9 +21,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-id", type=str, default="InvertedPendulum-v4")
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--max-steps", type=int, default=1000)
-    parser.add_argument("--num-sequences", type=int, default=8192)
+    parser.add_argument("--num-sequences", type=int, default=2048)
     parser.add_argument("--horizon", type=int, default=12)
-    parser.add_argument("--action-cost", type=float, default=0.003)
+    parser.add_argument("--action-cost", type=float, default=0.001)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--render", action="store_true")
     return parser.parse_args()
@@ -54,6 +55,24 @@ def prepare_planner_inputs(env, obs_dim: int, obs_mean, obs_std, device: torch.d
     return SimpleNamespace(action_low=action_low, action_high=action_high, goal_t=goal_t)
 
 
+def maybe_launch_mujoco_viewer(env, enable_render: bool):
+    """按需启动 MuJoCo 官方被动 viewer。"""
+    if not enable_render:
+        return nullcontext(None)
+
+    try:
+        import mujoco.viewer
+    except ImportError as exc:
+        raise RuntimeError("Official MuJoCo viewer requires the `mujoco` Python package.") from exc
+
+    sim = env.unwrapped
+    model = getattr(sim, "model", None)
+    data = getattr(sim, "data", None)
+    if model is None or data is None:
+        raise RuntimeError("Current environment does not expose MuJoCo model/data for the official viewer.")
+    return mujoco.viewer.launch_passive(model, data, show_left_ui=True, show_right_ui=True)
+
+
 def run_episode(
     env,
     model: NeuralCML,
@@ -63,13 +82,19 @@ def run_episode(
     args: argparse.Namespace,
     device: torch.device,
     use_normalize: bool,
+    viewer,
 ) -> tuple[float, int]:
     """执行一条评估 episode。"""
     obs, _ = env.reset()
     ep_return = 0.0
     ep_len = 0
+    if viewer is not None:
+        viewer.sync()
 
     for _ in range(args.max_steps):
+        if viewer is not None and not viewer.is_running():
+            break
+
         norm_obs = obs.astype(np.float32)
         if use_normalize:
             norm_obs = normalize_obs(norm_obs, obs_mean, obs_std)
@@ -91,11 +116,12 @@ def run_episode(
         ep_return += float(reward)
         ep_len += 1
 
-        if args.render:
-            time.sleep(0.01)
+        if viewer is not None:
+            viewer.sync()
+            time.sleep(max(float(env.unwrapped.model.opt.timestep), 0.01))
 
-        if terminated or truncated:
-            break
+        # if terminated or truncated:
+        #     break
 
     return ep_return, ep_len
 
@@ -103,9 +129,8 @@ def run_episode(
 def main() -> None:
     args = parse_args()
     device = resolve_device(args.device)
-    use_normalize = False
-    render_mode = "human" if args.render else None
-    env = make_env(args.env_id, render_mode=render_mode)
+    use_normalize = True
+    env = make_env(args.env_id)
     obs_dim, action_dim = get_dims(env)
     model, obs_mean, obs_std = load_model_and_stats(args, obs_dim, action_dim, device)
     if use_normalize:
@@ -122,21 +147,23 @@ def main() -> None:
     returns = []
     lengths = []
 
-    for ep in range(args.episodes):
-        ep_return, ep_len = run_episode(
-            env=env,
-            model=model,
-            planner_inputs=planner_inputs,
-            obs_mean=obs_mean,
-            obs_std=obs_std,
-            args=args,
-            device=device,
-            use_normalize=use_normalize,
-        )
+    with maybe_launch_mujoco_viewer(env, args.render) as viewer:
+        for ep in range(args.episodes):
+            ep_return, ep_len = run_episode(
+                env=env,
+                model=model,
+                planner_inputs=planner_inputs,
+                obs_mean=obs_mean,
+                obs_std=obs_std,
+                args=args,
+                device=device,
+                use_normalize=use_normalize,
+                viewer=viewer,
+            )
 
-        returns.append(ep_return)
-        lengths.append(ep_len)
-        print(f"episode={ep} return={ep_return:.1f} length={ep_len}")
+            returns.append(ep_return)
+            lengths.append(ep_len)
+            print(f"episode={ep} return={ep_return:.1f} length={ep_len}")
 
     print(f"mean_return={np.mean(returns):.1f} +/- {np.std(returns):.1f}")
     print(f"mean_length={np.mean(lengths):.1f} +/- {np.std(lengths):.1f}")

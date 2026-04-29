@@ -36,7 +36,7 @@ For example: `runs\InvertedPendulum_v4\20260429_144020\model_100.pt`.
 ## Evaluate
 
 ```powershell
-python evaluate.py --checkpoint runs\InvertedPendulum_v4\20260429_171228\model_10000.pt --env-id InvertedPendulum-v4 --episodes 5 --device cuda --render
+python evaluate.py --checkpoint runs\InvertedPendulum_v4\20260429_202552\model_10000.pt --env-id InvertedPendulum-v4 --episodes 5 --device cuda --render
 ```
 
 ## Notes
