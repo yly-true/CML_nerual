@@ -149,11 +149,165 @@ def sample_action_sequences(
     horizon: int,
     action_dim: int,
     device: torch.device,
+    sampling_dist: str = "gaussian",
 ) -> torch.Tensor:
-    """在动作边界内均匀采样候选动作序列。"""
+    """在动作边界内采样候选动作序列。"""
     shape = (num_sequences, horizon, action_dim)
-    u = torch.rand(shape, device=device)
-    return action_low + u * (action_high - action_low)
+    low = action_low.view(1, 1, action_dim)
+    high = action_high.view(1, 1, action_dim)
+
+    if sampling_dist == "uniform":
+        u = torch.rand(shape, device=device)
+        return low + u * (high - low)
+
+    if sampling_dist == "gaussian":
+        mean = torch.zeros(shape, device=device)
+        std = ((action_high - action_low) / 20.0).view(1, 1, action_dim).expand(shape)
+        actions = torch.normal(mean=mean, std=std)
+        return torch.clamp(actions, min=low, max=high)
+
+    raise ValueError(f"Unsupported sampling_dist: {sampling_dist}")
+
+
+def plan_action_continuous(
+    model: NeuralCML,
+    obs: torch.Tensor,
+    goal_obs: torch.Tensor,
+    action_low: torch.Tensor,
+    action_high: torch.Tensor,
+    action_cost: float = 1e-3,
+    opt_steps: int = 32,
+    opt_lr: float = 0.05,
+) -> torch.Tensor:
+    """Optimize the current continuous action with the CML utility.
+
+    The optimized objective is:
+
+        U(a) = (s_goal - s)^T (transition(s, a) - s) - lambda * ||a||^2
+
+    This is a single-step continuous CML action choice, not sequence sampling
+    or MPC. The model weights are treated as fixed; only the action tensor is
+    optimized.
+    """
+    action_dim = action_low.shape[-1]
+    low = action_low.view(1, action_dim)
+    high = action_high.view(1, action_dim)
+    requires_grad = [param.requires_grad for param in model.parameters()]
+
+    try:
+        for param in model.parameters():
+            param.requires_grad_(False)
+
+        with torch.no_grad():
+            state = model.encode(obs.view(1, -1)).detach()
+            goal_state = model.encode(goal_obs.view(1, -1)).detach()
+            direction = goal_state - state
+            init = torch.zeros((1, action_dim), dtype=torch.float32, device=obs.device)
+            init = torch.clamp(init, min=low, max=high)
+
+        with torch.enable_grad():
+            action = init.detach().clone().requires_grad_(True)
+            optimizer = torch.optim.Adam([action], lr=opt_lr)
+
+            for _ in range(opt_steps):
+                optimizer.zero_grad(set_to_none=True)
+                delta = model.transition(state, action) - state
+                utility = (direction * delta).sum(dim=-1) - action_cost * action.pow(2).sum(dim=-1)
+                loss = -utility.mean()
+                loss.backward()
+                optimizer.step()
+                with torch.no_grad():
+                    action.clamp_(min=low, max=high)
+
+        return action.detach().view(action_dim)
+    finally:
+        for param, old_requires_grad in zip(model.parameters(), requires_grad):
+            param.requires_grad_(old_requires_grad)
+
+
+@torch.no_grad()
+def _normalize_weights(weights: torch.Tensor | None, dim: int, device: torch.device) -> torch.Tensor:
+    """Return per-dimension weights for observation/state costs."""
+    if weights is None:
+        return torch.ones(dim, dtype=torch.float32, device=device)
+    return weights.to(device=device, dtype=torch.float32).view(dim)
+
+
+@torch.no_grad()
+def score_action_sequences(
+    model: NeuralCML,
+    obs: torch.Tensor,
+    goal_obs: torch.Tensor,
+    actions: torch.Tensor,
+    action_cost: float = 0.001,
+    objective: str = "latent-terminal",
+    obs_mean: torch.Tensor | None = None,
+    obs_std: torch.Tensor | None = None,
+    obs_weights: torch.Tensor | None = None,
+    terminal_weight: float = 1.0,
+) -> torch.Tensor:
+    """Score candidate action sequences using learned CML latent rollouts.
+
+    Supported objectives:
+    - latent-terminal: original behavior, only terminal latent distance
+    - latent-trajectory: accumulated latent distance along the rollout
+    - obs-terminal: terminal decoded-observation distance
+    - obs-trajectory: accumulated decoded-observation distance
+    """
+    device = obs.device
+    num_sequences, horizon, _ = actions.shape
+
+    obs_batch = obs.unsqueeze(0).repeat(num_sequences, 1)
+    goal_batch = goal_obs.unsqueeze(0).repeat(num_sequences, 1)
+
+    state = model.encode(obs_batch)
+    use_latent = objective.startswith("latent")
+    use_obs = objective.startswith("obs")
+    use_trajectory = objective.endswith("trajectory")
+    use_terminal = objective.endswith("terminal")
+    if not ((use_latent or use_obs) and (use_trajectory or use_terminal)):
+        raise ValueError(f"Unsupported objective: {objective}")
+
+    if use_latent:
+        goal_state = model.encode(goal_batch)
+        weights = _normalize_weights(None, model.latent_dim, device)
+    else:
+        goal_raw = goal_batch
+        if obs_mean is not None and obs_std is not None:
+            goal_raw = goal_raw * obs_std.view(1, -1) + obs_mean.view(1, -1)
+        weights = _normalize_weights(obs_weights, model.obs_dim, device)
+
+    distance_cost = torch.zeros(num_sequences, device=device)
+    total_action_cost = torch.zeros(num_sequences, device=device)
+    for t in range(horizon):
+        a_t = actions[:, t, :]
+        state = model.transition(state, a_t)
+        total_action_cost += a_t.pow(2).mean(dim=-1)
+
+        if use_trajectory:
+            if use_latent:
+                step_distance = ((state - goal_state).pow(2) * weights.view(1, -1)).mean(dim=-1)
+            else:
+                pred_obs = model.decode(state)
+                if obs_mean is not None and obs_std is not None:
+                    pred_obs = pred_obs * obs_std.view(1, -1) + obs_mean.view(1, -1)
+                step_distance = ((pred_obs - goal_raw).pow(2) * weights.view(1, -1)).mean(dim=-1)
+            distance_cost += step_distance
+
+    if use_terminal:
+        if use_latent:
+            terminal_distance = ((state - goal_state).pow(2) * weights.view(1, -1)).mean(dim=-1)
+        else:
+            pred_obs = model.decode(state)
+            if obs_mean is not None and obs_std is not None:
+                pred_obs = pred_obs * obs_std.view(1, -1) + obs_mean.view(1, -1)
+            terminal_distance = ((pred_obs - goal_raw).pow(2) * weights.view(1, -1)).mean(dim=-1)
+        distance_cost = terminal_weight * terminal_distance
+    else:
+        distance_cost = distance_cost / max(horizon, 1)
+
+    score = -distance_cost - action_cost * total_action_cost
+    return score
 
 
 @torch.no_grad()
@@ -166,21 +320,16 @@ def plan_action_random_shooting(
     num_sequences: int = 1024,
     horizon: int = 8,
     action_cost: float = 0.001,
+    sampling_dist: str = "gaussian",
+    objective: str = "latent-terminal",
+    obs_mean: torch.Tensor | None = None,
+    obs_std: torch.Tensor | None = None,
+    obs_weights: torch.Tensor | None = None,
+    terminal_weight: float = 1.0,
 ) -> torch.Tensor:
-    """用短时域 random shooting 选择下一步动作。
-
-    评分逻辑是：预测轨迹末端越接近目标 latent state 越好，
-    同时对动作幅度施加一个轻微代价。
-    这可以看作把论文中的单步 utility 扩展到了连续动作和多步预测。
-    """
+    """用短时域 random shooting 选择下一步动作。"""
     device = obs.device
     action_dim = action_low.shape[-1]
-
-    obs_batch = obs.unsqueeze(0).repeat(num_sequences, 1)
-    goal_batch = goal_obs.unsqueeze(0).repeat(num_sequences, 1)
-
-    state = model.encode(obs_batch)
-    goal_state = model.encode(goal_batch)
     actions = sample_action_sequences(
         action_low=action_low,
         action_high=action_high,
@@ -188,16 +337,81 @@ def plan_action_random_shooting(
         horizon=horizon,
         action_dim=action_dim,
         device=device,
+        sampling_dist=sampling_dist,
     )
-
-    total_action_cost = torch.zeros(num_sequences, device=device)
-    for t in range(horizon):
-        # 将每条候选序列在 latent 空间中向前 rollout。
-        a_t = actions[:, t, :]
-        state = model.transition(state, a_t)
-        total_action_cost += a_t.pow(2).mean(dim=-1)
-
-    latent_distance = (state - goal_state).pow(2).mean(dim=-1)
-    score = -latent_distance - action_cost * total_action_cost
+    score = score_action_sequences(
+        model=model,
+        obs=obs,
+        goal_obs=goal_obs,
+        actions=actions,
+        action_cost=action_cost,
+        objective=objective,
+        obs_mean=obs_mean,
+        obs_std=obs_std,
+        obs_weights=obs_weights,
+        terminal_weight=terminal_weight,
+    )
     best = torch.argmax(score)
     return actions[best, 0, :]
+
+
+@torch.no_grad()
+def plan_action_cem(
+    model: NeuralCML,
+    obs: torch.Tensor,
+    goal_obs: torch.Tensor,
+    action_low: torch.Tensor,
+    action_high: torch.Tensor,
+    num_sequences: int = 1024,
+    horizon: int = 8,
+    action_cost: float = 0.001,
+    objective: str = "latent-trajectory",
+    iterations: int = 4,
+    elite_frac: float = 0.1,
+    init_std_scale: float = 0.5,
+    min_std: float = 1e-3,
+    obs_mean: torch.Tensor | None = None,
+    obs_std: torch.Tensor | None = None,
+    obs_weights: torch.Tensor | None = None,
+    terminal_weight: float = 1.0,
+) -> torch.Tensor:
+    """Cross-Entropy Method MPC over CML latent rollouts."""
+    device = obs.device
+    action_dim = action_low.shape[-1]
+    shape = (num_sequences, horizon, action_dim)
+    low = action_low.view(1, 1, action_dim)
+    high = action_high.view(1, 1, action_dim)
+    mean = torch.zeros((horizon, action_dim), dtype=torch.float32, device=device)
+    std = ((action_high - action_low) * init_std_scale).view(1, action_dim).repeat(horizon, 1)
+    elite_count = max(1, int(num_sequences * elite_frac))
+
+    best_actions = None
+    best_score = None
+    for _ in range(iterations):
+        actions = mean.view(1, horizon, action_dim) + std.view(1, horizon, action_dim) * torch.randn(shape, device=device)
+        actions = torch.clamp(actions, min=low, max=high)
+        score = score_action_sequences(
+            model=model,
+            obs=obs,
+            goal_obs=goal_obs,
+            actions=actions,
+            action_cost=action_cost,
+            objective=objective,
+            obs_mean=obs_mean,
+            obs_std=obs_std,
+            obs_weights=obs_weights,
+            terminal_weight=terminal_weight,
+        )
+        elite_idx = torch.topk(score, elite_count).indices
+        elites = actions[elite_idx]
+        mean = elites.mean(dim=0)
+        std = torch.clamp(elites.std(dim=0, unbiased=False), min=min_std)
+
+        iter_best = torch.argmax(score)
+        if best_score is None or score[iter_best] > best_score:
+            best_score = score[iter_best]
+            best_actions = actions[iter_best]
+
+    if best_actions is None:
+        return mean[0]
+    return best_actions[0]

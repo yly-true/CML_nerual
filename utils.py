@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any, Dict
 
@@ -11,9 +14,28 @@ import numpy as np
 import torch
 
 
-def make_env(env_id: str, render_mode: str | None = None):
+def make_env(env_id: str, render_mode: str | None = None, xml_file: str | None = None):
     """创建 Gymnasium 环境。"""
-    return gym.make(env_id, render_mode=render_mode)
+    make_kwargs = {}
+    if render_mode is not None:
+        make_kwargs["render_mode"] = render_mode
+    if xml_file is not None:
+        xml_path = Path(xml_file)
+        if not xml_path.is_absolute():
+            xml_path = xml_path.resolve()
+        # MuJoCo 在 Windows 上有时无法稳定读取包含非 ASCII 字符的路径。
+        # 若路径里含中文等字符，就复制到纯 ASCII 临时目录后再加载。
+        try:
+            str(xml_path).encode("ascii")
+            safe_xml_path = xml_path
+        except UnicodeEncodeError:
+            cache_dir = Path(tempfile.gettempdir()) / "mujoco_xml_cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            suffix = hashlib.md5(str(xml_path).encode("utf-8")).hexdigest()[:8]
+            safe_xml_path = cache_dir / f"{xml_path.stem}_{suffix}{xml_path.suffix}"
+            shutil.copy2(xml_path, safe_xml_path)
+        make_kwargs["xml_file"] = str(safe_xml_path)
+    return gym.make(env_id, **make_kwargs)
 
 
 def get_dims(env) -> tuple[int, int]:
@@ -21,6 +43,33 @@ def get_dims(env) -> tuple[int, int]:
     obs_dim = int(np.prod(env.observation_space.shape))
     action_dim = int(np.prod(env.action_space.shape))
     return obs_dim, action_dim
+
+
+def pendulum_obs_to_features(obs) -> np.ndarray:
+    """Convert raw [x, theta, xdot, thetadot] obs to periodic angle features.
+
+    Returned order:
+    [x, sin(theta), cos(theta), xdot, thetadot]
+    """
+    obs_arr = np.asarray(obs, dtype=np.float32)
+    features = np.zeros(obs_arr.shape[:-1] + (5,), dtype=np.float32)
+    features[..., 0] = obs_arr[..., 0]
+    features[..., 1] = np.sin(obs_arr[..., 1])
+    features[..., 2] = np.cos(obs_arr[..., 1])
+    features[..., 3] = obs_arr[..., 2]
+    features[..., 4] = obs_arr[..., 3]
+    return features
+
+
+def upright_feature_target(
+    raw_obs,
+    cart_pos: float = 0.0,
+    cart_vel: float = 0.0,
+    pole_ang_vel: float = 0.0,
+) -> np.ndarray:
+    """Build a feature-space upright target for swing-up control."""
+    _ = raw_obs
+    return np.asarray([cart_pos, 0.0, 1.0, cart_vel, pole_ang_vel], dtype=np.float32)
 
 
 def default_goal_obs(env, obs_dim: int) -> np.ndarray:
