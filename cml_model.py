@@ -162,7 +162,7 @@ def sample_action_sequences(
 
     if sampling_dist == "gaussian":
         mean = torch.zeros(shape, device=device)
-        std = ((action_high - action_low) / 20.0).view(1, 1, action_dim).expand(shape)
+        std = ((action_high - action_low) / 4.0).view(1, 1, action_dim).expand(shape)
         actions = torch.normal(mean=mean, std=std)
         return torch.clamp(actions, min=low, max=high)
 

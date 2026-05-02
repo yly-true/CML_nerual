@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+import os
 from pathlib import Path
+import sys
 import time
 from types import SimpleNamespace
 
@@ -22,10 +24,10 @@ def parse_args() -> argparse.Namespace:
     default_xml = str((Path(__file__).resolve().parent / "inverted_pendulum_v5.xml"))
     parser.add_argument("--env-id", type=str, default="InvertedPendulum-v5")
     parser.add_argument("--xml-file", type=str, default=default_xml)
-    parser.add_argument("--episodes", type=int, default=10)
+    parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--max-steps", type=int, default=1000)
-    parser.add_argument("--num-sequences", type=int, default=2048)
-    parser.add_argument("--horizon", type=int, default=10)
+    parser.add_argument("--num-sequences", type=int, default=2048*4)
+    parser.add_argument("--horizon", type=int, default=5)
     parser.add_argument("--action-cost", type=float, default=0)
     parser.add_argument("--action-sampling", type=str, choices=("uniform", "gaussian"), default="gaussian")
     parser.add_argument(
@@ -50,11 +52,16 @@ def parse_args() -> argparse.Namespace:
         help="Optional feature weights: [x, sin(theta), cos(theta), xdot, thetadot].",
     )
     parser.add_argument("--init-cart-pos", type=float, default=0)
-    parser.add_argument("--init-pole-angle", type=float, default=0)
+    parser.add_argument("--init-pole-angle", type=float, default=3.14)
     parser.add_argument("--init-cart-vel", type=float, default=0)
     parser.add_argument("--init-pole-ang-vel", type=float, default=0)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--render", action="store_true")
+    parser.add_argument("--render-sleep", type=float, default=0.0, help="Seconds to sleep after rendered frames.")
+    parser.add_argument("--render-every", type=int, default=1, help="Render every N environment steps.")
+    parser.add_argument("--log-every", type=int, default=20, help="Print obs every N steps. Use 0 to disable step logs.")
+    parser.add_argument("--camera-name", type=str, default="track_cart", help="MuJoCo camera name used for rendering.")
+    parser.add_argument("--reset-key", type=str, default="1", help="SSH terminal key that resets env to the init state.")
     parser.add_argument(
         "--render-backend",
         type=str,
@@ -74,6 +81,20 @@ def objective_from_inference_mode(inference_mode: str) -> str:
         "latenttraj": "latent-trajectory",
     }
     return objective_by_mode[inference_mode]
+
+
+def print_model_size(model: NeuralCML, model_args: dict, obs_dim: int, action_dim: int) -> None:
+    """打印当前加载模型的规模，便于确认 checkpoint 结构。"""
+    total_params = sum(param.numel() for param in model.parameters())
+    trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    param_mb = sum(param.numel() * param.element_size() for param in model.parameters()) / 1024 / 1024
+    print(
+        "Model size: "
+        f"obs_dim={obs_dim}, action_dim={action_dim}, "
+        f"latent_dim={model_args['latent_dim']}, hidden_dim={model_args['hidden_dim']}, "
+        f"depth={model_args['depth']}, "
+        f"params={total_params:,}, trainable={trainable_params:,}, param_memory={param_mb:.3f} MB"
+    )
 
 
 def load_model_and_stats(args: argparse.Namespace, action_dim: int, device: torch.device):
@@ -96,6 +117,7 @@ def load_model_and_stats(args: argparse.Namespace, action_dim: int, device: torc
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
+    print_model_size(model, model_args, obs_dim, action_dim)
     return model, ckpt["obs_mean"], ckpt["obs_std"]
 
 
@@ -150,10 +172,50 @@ def maybe_launch_mujoco_viewer(env, args: argparse.Namespace):
     return mujoco.viewer.launch_passive(model, data, show_left_ui=True, show_right_ui=True)
 
 
+def configure_named_camera(model, cam, camera_name: str | None) -> None:
+    """Switch a MuJoCo viewer camera to a named fixed/tracking XML camera."""
+    if cam is None or not camera_name:
+        return
+
+    try:
+        import mujoco
+    except ImportError:
+        return
+
+    camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
+    if camera_id < 0:
+        print(f"warning: camera '{camera_name}' not found in MuJoCo model.")
+        return
+
+    cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+    cam.fixedcamid = camera_id
+
+
+def maybe_configure_passive_camera(env, viewer, args: argparse.Namespace) -> None:
+    """Configure the official passive viewer camera if it is available."""
+    if viewer is None:
+        return
+    configure_named_camera(env.unwrapped.model, getattr(viewer, "cam", None), args.camera_name)
+
+
+def maybe_configure_human_camera(env, args: argparse.Namespace) -> None:
+    """Configure Gymnasium's human viewer camera after the viewer is created."""
+    renderer = getattr(env.unwrapped, "mujoco_renderer", None)
+    viewer = getattr(renderer, "viewer", None)
+    configure_named_camera(env.unwrapped.model, getattr(viewer, "cam", None), args.camera_name)
+
+
 def maybe_render_human(env, args: argparse.Namespace) -> None:
     """Render one frame through Gymnasium's human render backend."""
     if args.render and args.render_backend == "human":
         env.render()
+        maybe_configure_human_camera(env, args)
+
+
+def maybe_sleep_after_render(args: argparse.Namespace) -> None:
+    """Optional render pacing; default is no sleep for faster visualization."""
+    if args.render_sleep > 0:
+        time.sleep(args.render_sleep)
 
 
 def format_obs_state(prefix: str, obs: np.ndarray) -> str:
@@ -198,6 +260,88 @@ def maybe_set_initial_state(env, args: argparse.Namespace) -> None:
     sim.set_state(qpos, qvel)
 
 
+class TerminalKeyListener:
+    """Non-blocking terminal key listener for SSH sessions.
+
+    On Linux/macOS this reads one key at a time from the SSH terminal without
+    requiring Enter. If stdin is not a TTY, the listener is disabled.
+    """
+
+    def __init__(self, reset_key: str = "1") -> None:
+        self.reset_key = reset_key
+        self.enabled = False
+        self.fd = None
+        self.old_settings = None
+        self.termios = None
+
+    def __enter__(self):
+        if os.name == "nt":
+            self.enabled = True
+            print(f"keyboard listener enabled: press '{self.reset_key}' to reset.")
+            return self
+
+        if not sys.stdin.isatty():
+            print("keyboard listener disabled: stdin is not a TTY.")
+            return self
+
+        import termios
+        import tty
+
+        self.termios = termios
+        self.fd = sys.stdin.fileno()
+        self.old_settings = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        self.enabled = True
+        print(f"SSH key listener enabled: press '{self.reset_key}' to reset to init state.")
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.enabled and os.name != "nt" and self.termios is not None and self.old_settings is not None:
+            self.termios.tcsetattr(self.fd, self.termios.TCSADRAIN, self.old_settings)
+
+    def _read_available_keys(self) -> list[str]:
+        if not self.enabled:
+            return []
+
+        if os.name == "nt":
+            try:
+                import msvcrt
+            except ImportError:
+                return []
+
+            keys = []
+            while msvcrt.kbhit():
+                keys.append(msvcrt.getwch())
+            return keys
+
+        import select
+
+        keys = []
+        while select.select([sys.stdin], [], [], 0)[0]:
+            key = sys.stdin.read(1)
+            if not key:
+                break
+            keys.append(key)
+        return keys
+
+    def reset_requested(self) -> bool:
+        return any(key == self.reset_key for key in self._read_available_keys())
+
+
+def reset_env_to_initial_state(env, args: argparse.Namespace, viewer=None) -> np.ndarray:
+    """Reset environment and reapply command-line initial state overrides."""
+    env.reset()
+    maybe_set_initial_state(env, args)
+    obs = env.unwrapped._get_obs()
+    print(format_obs_state("reset_obs", obs))
+    if viewer is not None:
+        maybe_configure_passive_camera(env, viewer, args)
+        viewer.sync()
+    else:
+        maybe_render_human(env, args)
+    return obs
+
+
 def run_episode(
     env,
     model: NeuralCML,
@@ -210,66 +354,68 @@ def run_episode(
     viewer,
 ) -> tuple[float, int]:
     """执行一条评估 episode。"""
-    obs, _ = env.reset()
-    maybe_set_initial_state(env, args)
-    obs = env.unwrapped._get_obs()
+    obs = reset_env_to_initial_state(env, args, viewer)
     print(format_obs_state("initial_obs", obs))
     ep_return = 0.0
     ep_len = 0
-    if viewer is not None:
-        viewer.sync()
-    else:
-        maybe_render_human(env, args)
 
-    for _ in range(args.max_steps):
-        if viewer is not None and not viewer.is_running():
-            break
+    with TerminalKeyListener(args.reset_key) as key_listener:
+        for _ in range(args.max_steps):
+            if viewer is not None and not viewer.is_running():
+                break
 
-        obs_features = pendulum_obs_to_features(obs)
-        norm_obs = obs_features.astype(np.float32)
-        if use_normalize:
-            norm_obs = normalize_obs(norm_obs, obs_mean, obs_std)
-        obs_t = torch.as_tensor(norm_obs, dtype=torch.float32, device=device)
+            if key_listener.reset_requested():
+                obs = reset_env_to_initial_state(env, args, viewer)
+                continue
 
-        goal_features = build_dynamic_target_features(obs, args)
-        norm_goal = goal_features
-        if use_normalize:
-            norm_goal = normalize_obs(norm_goal, obs_mean, obs_std)
-        goal_t = torch.as_tensor(norm_goal, dtype=torch.float32, device=device)
-        objective = objective_from_inference_mode(args.inference_mode)
+            obs_features = pendulum_obs_to_features(obs)
+            norm_obs = obs_features.astype(np.float32)
+            if use_normalize:
+                norm_obs = normalize_obs(norm_obs, obs_mean, obs_std)
+            obs_t = torch.as_tensor(norm_obs, dtype=torch.float32, device=device)
 
-        action_t = plan_action_random_shooting(
-            model=model,
-            obs=obs_t,
-            goal_obs=goal_t,
-            action_low=planner_inputs.action_low,
-            action_high=planner_inputs.action_high,
-            num_sequences=args.num_sequences,
-            horizon=args.horizon,
-            action_cost=args.action_cost,
-            sampling_dist=args.action_sampling,
-            objective=objective,
-            obs_mean=planner_inputs.obs_mean_t,
-            obs_std=planner_inputs.obs_std_t,
-            obs_weights=planner_inputs.obs_weights_t,
-        )
-        action = action_t.detach().cpu().numpy()
+            goal_features = build_dynamic_target_features(obs, args)
+            norm_goal = goal_features
+            if use_normalize:
+                norm_goal = normalize_obs(norm_goal, obs_mean, obs_std)
+            goal_t = torch.as_tensor(norm_goal, dtype=torch.float32, device=device)
+            objective = objective_from_inference_mode(args.inference_mode)
 
-        obs, reward, terminated, truncated, _ = env.step(action)
-        ep_return += float(reward)
-        ep_len += 1
-        print(format_obs_state("obs", obs))
+            action_t = plan_action_random_shooting(
+                model=model,
+                obs=obs_t,
+                goal_obs=goal_t,
+                action_low=planner_inputs.action_low,
+                action_high=planner_inputs.action_high,
+                num_sequences=args.num_sequences,
+                horizon=args.horizon,
+                action_cost=args.action_cost,
+                sampling_dist=args.action_sampling,
+                objective=objective,
+                obs_mean=planner_inputs.obs_mean_t,
+                obs_std=planner_inputs.obs_std_t,
+                obs_weights=planner_inputs.obs_weights_t,
+            )
+            action = action_t.detach().cpu().numpy()
 
-        if viewer is not None:
-            viewer.sync()
-            time.sleep(max(float(env.unwrapped.model.opt.timestep), 0.01))
-        else:
-            maybe_render_human(env, args)
-            if args.render and args.render_backend == "human":
-                time.sleep(max(float(env.unwrapped.model.opt.timestep), 0.01))
+            obs, reward, terminated, truncated, _ = env.step(action)
+            time.sleep(0.08)  # Small sleep to improve rendering smoothness; adjust as needed.
+            ep_return += float(reward)
+            ep_len += 1
+            if args.log_every > 0 and ep_len % args.log_every == 0:
+                print(format_obs_state("obs", obs))
 
-        # if terminated or truncated:
-        #     break
+            should_render = args.render_every > 0 and ep_len % args.render_every == 0
+            if viewer is not None and should_render:
+                viewer.sync()
+                maybe_sleep_after_render(args)
+            elif viewer is None and should_render:
+                maybe_render_human(env, args)
+                if args.render and args.render_backend == "human":
+                    maybe_sleep_after_render(args)
+
+            # if terminated or truncated:
+            #     break
 
     return ep_return, ep_len
 
@@ -305,7 +451,11 @@ def main() -> None:
         f"num_sequences={args.num_sequences}, horizon={args.horizon}"
     )
     if args.render:
-        print(f"render: backend={args.render_backend}")
+        print(
+            f"render: backend={args.render_backend}, render_every={args.render_every}, "
+            f"render_sleep={args.render_sleep}, log_every={args.log_every}, "
+            f"camera_name={args.camera_name}, reset_key={args.reset_key}"
+        )
 
     returns = []
     lengths = []

@@ -1,1 +1,8 @@
 runs/
+logs/
+__pycache__/
+*.py[cod]
+*.zip
+*.pt
+*.pth
+*.ckpt
