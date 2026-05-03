@@ -1,0 +1,604 @@
+MuJoCo version 3.2.7
+model name     inverted pendulum
+
+MEMORY
+  total           9.1 KB
+
+SIZES
+  nq                  2
+  nv                  2
+  nu                  1
+  nbody               3
+  nbvh                19
+  nbvhstatic          19
+  njnt                2
+  ngeom               11
+  ncam                1
+  nnames              181
+  npaths              1
+  nnames_map          36
+  nM                  3
+  nB                  6
+  nC                  3
+  nD                  4
+  nJmom               1
+  ntree               1
+  njmax               -1
+  nconmax             -1
+  narena              4194304
+  nbuffer             14081
+
+OPTION
+  timestep            0.02    
+  apirate             1e+02   
+  impratio            1       
+  tolerance           1e-08   
+  ls_tolerance        0.01    
+  noslip_tolerance    1e-06   
+  ccd_tolerance       1e-06   
+  density             0       
+  viscosity           0       
+  o_margin            0       
+  integrator          1
+  cone                0
+  jacobian            2
+  solver              2
+  iterations          100
+  ls_iterations       50
+  noslip_iterations   0
+  ccd_iterations      50
+  disableflags        0
+  enableflags         0
+  disableactuator     0
+  sdf_initpoints      40
+  sdf_iterations      10
+  gravity             0         0        -9.8      
+  wind                0         0         0        
+  magnetic            0        -0.5       0        
+  o_solref            0.02      1        
+  o_solimp            0.9       0.95      0.001     0.5       2        
+  o_friction          1         1         0.005     0.0001    0.0001   
+
+totalmass             15      
+
+STATISTIC
+  meaninertia         8.1     
+  meanmass            7.7     
+  meansize            0.27    
+  extent              2e+02   
+  center              0        0        0       
+
+qpos0                 0         0        
+
+qpos_spring           0         0        
+
+
+BODY 0:
+  name                  world
+  body_parentid         0 
+  body_rootid           0 
+  body_weldid           0 
+  body_mocapid          -1 
+  body_jntnum           0 
+  body_jntadr           -1 
+  body_dofnum           0 
+  body_dofadr           -1 
+  body_treeid           -1 
+  body_geomnum          9 
+  body_geomadr          0 
+  body_simple           1 
+  body_sameframe        1 
+  body_pos              0         0         0        
+  body_quat             1         0         0         0        
+  body_ipos             0         0         0        
+  body_iquat            1         0         0         0        
+  body_mass             0        
+  body_subtreemass      15       
+  body_inertia          0         0         0        
+  body_invweight0       0         0        
+  body_gravcomp         0        
+  body_margin           0        
+  body_plugin           -1 
+  body_contype          0 
+  body_conaffinity      1 
+  body_bvhadr           0 
+  body_bvhnum           17 
+
+BODY 1:
+  name                  cart
+  body_parentid         0 
+  body_rootid           1 
+  body_weldid           1 
+  body_mocapid          -1 
+  body_jntnum           1 
+  body_jntadr           0 
+  body_dofnum           1 
+  body_dofadr           0 
+  body_treeid           0 
+  body_geomnum          1 
+  body_geomadr          9 
+  body_simple           0 
+  body_sameframe        0 
+  body_pos              0         0         0        
+  body_quat             1         0         0         0        
+  body_ipos             0         0         0        
+  body_iquat            0.71      0         0.71      0        
+  body_mass             10       
+  body_subtreemass      15       
+  body_inertia          0.13      0.13      0.048    
+  body_invweight0       0.028     0        
+  body_gravcomp         0        
+  body_margin           0        
+  body_plugin           -1 
+  body_contype          0 
+  body_conaffinity      1 
+  body_bvhadr           17 
+  body_bvhnum           1 
+
+BODY 2:
+  name                  pole
+  body_parentid         1 
+  body_rootid           1 
+  body_weldid           2 
+  body_mocapid          -1 
+  body_jntnum           1 
+  body_jntadr           1 
+  body_dofnum           1 
+  body_dofadr           1 
+  body_treeid           0 
+  body_geomnum          1 
+  body_geomadr          10 
+  body_simple           0 
+  body_sameframe        0 
+  body_pos              0         0         0        
+  body_quat             1         0         0         0        
+  body_ipos             0.0005    0         0.3      
+  body_iquat            0.00083  -0        -1         0        
+  body_mass             5        
+  body_subtreemass      5        
+  body_inertia          0.19      0.19      0.0059   
+  body_invweight0       0.049     0.67     
+  body_gravcomp         0        
+  body_margin           0        
+  body_plugin           -1 
+  body_contype          0 
+  body_conaffinity      1 
+  body_bvhadr           18 
+  body_bvhnum           1 
+
+
+JOINT 0:
+  name                  slider
+  jnt_type              2 
+  jnt_qposadr           0 
+  jnt_dofadr            0 
+  jnt_bodyid            1 
+  jnt_group             0 
+  jnt_limited           1 
+  jnt_actfrclimited     0 
+  jnt_actgravcomp       0 
+  jnt_solref            0.02      1        
+  jnt_solimp            0.9       0.95      0.001     0.5       2        
+  jnt_pos               0         0         0        
+  jnt_axis              1         0         0        
+  jnt_stiffness         0        
+  jnt_range            -1e+02     1e+02    
+  jnt_actfrcrange       0         0        
+  jnt_margin            0        
+
+JOINT 1:
+  name                  hinge
+  jnt_type              3 
+  jnt_qposadr           1 
+  jnt_dofadr            1 
+  jnt_bodyid            2 
+  jnt_group             0 
+  jnt_limited           0 
+  jnt_actfrclimited     0 
+  jnt_actgravcomp       0 
+  jnt_solref            0.02      1        
+  jnt_solimp            0.9       0.95      0.001     0.5       2        
+  jnt_pos               0         0         0        
+  jnt_axis              0         1         0        
+  jnt_stiffness         0        
+  jnt_range             0         0        
+  jnt_actfrcrange       0         0        
+  jnt_margin            0        
+
+
+DOF 0:
+  dof_bodyid            1 
+  dof_jntid             0 
+  dof_parentid          -1 
+  dof_treeid            0 
+  dof_Madr              0 
+  dof_simplenum         0 
+  dof_solref            0.02      1        
+  dof_solimp            0.9       0.95      0.001     0.5       2        
+  dof_frictionloss      0        
+  dof_armature          0        
+  dof_damping           1        
+  dof_invweight0        0.084    
+  dof_M0                15       
+
+DOF 1:
+  dof_bodyid            2 
+  dof_jntid             1 
+  dof_parentid          0 
+  dof_treeid            0 
+  dof_Madr              1 
+  dof_simplenum         0 
+  dof_solref            0.02      1        
+  dof_solimp            0.9       0.95      0.001     0.5       2        
+  dof_frictionloss      0        
+  dof_armature          0        
+  dof_damping           1        
+  dof_invweight0        2        
+  dof_M0                0.64     
+
+
+GEOM 0:
+  name                  rail_red
+  geom_type             3 
+  geom_contype          0 
+  geom_conaffinity      1 
+  geom_condim           3 
+  geom_bodyid           0 
+  geom_dataid           -1 
+  geom_matid            -1 
+  geom_group            0 
+  geom_priority         0 
+  geom_plugin           -1 
+  geom_sameframe        0 
+  geom_solmix           1        
+  geom_solref           0.02      1        
+  geom_solimp           0.9       0.95      0.001     0.5       2        
+  geom_size             0.02      12        0        
+  geom_aabb             0         0         0         0.02      0.02      13       
+  geom_rbound           13       
+  geom_pos             -88        0         0        
+  geom_quat             0.71      0        -0.71      0        
+  geom_friction         1         0.1       0.1      
+  geom_margin           0        
+  geom_gap              0        
+  geom_fluid            0         0         0         0         0         0         0         0         0         0         0         0        
+  geom_rgba             0.95      0.15      0.15      1        
+
+GEOM 1:
+  name                  rail_orange
+  geom_type             3 
+  geom_contype          0 
+  geom_conaffinity      1 
+  geom_condim           3 
+  geom_bodyid           0 
+  geom_dataid           -1 
+  geom_matid            -1 
+  geom_group            0 
+  geom_priority         0 
+  geom_plugin           -1 
+  geom_sameframe        0 
+  geom_solmix           1        
+  geom_solref           0.02      1        
+  geom_solimp           0.9       0.95      0.001     0.5       2        
+  geom_size             0.02      12        0        
+  geom_aabb             0         0         0         0.02      0.02      13       
+  geom_rbound           13       
+  geom_pos             -62        0         0        
+  geom_quat             0.71      0        -0.71      0        
+  geom_friction         1         0.1       0.1      
+  geom_margin           0        
+  geom_gap              0        
+  geom_fluid            0         0         0         0         0         0         0         0         0         0         0         0        
+  geom_rgba             1         0.55      0.05      1        
+
+GEOM 2:
+  name                  rail_yellow
+  geom_type             3 
+  geom_contype          0 
+  geom_conaffinity      1 
+  geom_condim           3 
+  geom_bodyid           0 
+  geom_dataid           -1 
+  geom_matid            -1 
+  geom_group            0 
+  geom_priority         0 
+  geom_plugin           -1 
+  geom_sameframe        0 
+  geom_solmix           1        
+  geom_solref           0.02      1        
+  geom_solimp           0.9       0.95      0.001     0.5       2        
+  geom_size             0.02      12        0        
+  geom_aabb             0         0         0         0.02      0.02      13       
+  geom_rbound           13       
+  geom_pos             -38        0         0        
+  geom_quat             0.71      0        -0.71      0        
+  geom_friction         1         0.1       0.1      
+  geom_margin           0        
+  geom_gap              0        
+  geom_fluid            0         0         0         0         0         0         0         0         0         0         0         0        
+  geom_rgba             0.95      0.85      0.05      1        
+
+GEOM 3:
+  name                  rail_green
+  geom_type             3 
+  geom_contype          0 
+  geom_conaffinity      1 
+  geom_condim           3 
+  geom_bodyid           0 
+  geom_dataid           -1 
+  geom_matid            -1 
+  geom_group            0 
+  geom_priority         0 
+  geom_plugin           -1 
+  geom_sameframe        0 
+  geom_solmix           1        
+  geom_solref           0.02      1        
+  geom_solimp           0.9       0.95      0.001     0.5       2        
+  geom_size             0.02      12        0        
+  geom_aabb             0         0         0         0.02      0.02      13       
+  geom_rbound           13       
+  geom_pos             -12        0         0        
+  geom_quat             0.71      0        -0.71      0        
+  geom_friction         1         0.1       0.1      
+  geom_margin           0        
+  geom_gap              0        
+  geom_fluid            0         0         0         0         0         0         0         0         0         0         0         0        
+  geom_rgba             0.1       0.75      0.25      1        
+
+GEOM 4:
+  name                  rail_cyan
+  geom_type             3 
+  geom_contype          0 
+  geom_conaffinity      1 
+  geom_condim           3 
+  geom_bodyid           0 
+  geom_dataid           -1 
+  geom_matid            -1 
+  geom_group            0 
+  geom_priority         0 
+  geom_plugin           -1 
+  geom_sameframe        0 
+  geom_solmix           1        
+  geom_solref           0.02      1        
+  geom_solimp           0.9       0.95      0.001     0.5       2        
+  geom_size             0.02      12        0        
+  geom_aabb             0         0         0         0.02      0.02      13       
+  geom_rbound           13       
+  geom_pos              12        0         0        
+  geom_quat             0.71      0        -0.71      0        
+  geom_friction         1         0.1       0.1      
+  geom_margin           0        
+  geom_gap              0        
+  geom_fluid            0         0         0         0         0         0         0         0         0         0         0         0        
+  geom_rgba             0         0.8       0.9       1        
+
+GEOM 5:
+  name                  rail_blue
+  geom_type             3 
+  geom_contype          0 
+  geom_conaffinity      1 
+  geom_condim           3 
+  geom_bodyid           0 
+  geom_dataid           -1 
+  geom_matid            -1 
+  geom_group            0 
+  geom_priority         0 
+  geom_plugin           -1 
+  geom_sameframe        0 
+  geom_solmix           1        
+  geom_solref           0.02      1        
+  geom_solimp           0.9       0.95      0.001     0.5       2        
+  geom_size             0.02      12        0        
+  geom_aabb             0         0         0         0.02      0.02      13       
+  geom_rbound           13       
+  geom_pos              38        0         0        
+  geom_quat             0.71      0        -0.71      0        
+  geom_friction         1         0.1       0.1      
+  geom_margin           0        
+  geom_gap              0        
+  geom_fluid            0         0         0         0         0         0         0         0         0         0         0         0        
+  geom_rgba             0.1       0.3       1         1        
+
+GEOM 6:
+  name                  rail_purple
+  geom_type             3 
+  geom_contype          0 
+  geom_conaffinity      1 
+  geom_condim           3 
+  geom_bodyid           0 
+  geom_dataid           -1 
+  geom_matid            -1 
+  geom_group            0 
+  geom_priority         0 
+  geom_plugin           -1 
+  geom_sameframe        0 
+  geom_solmix           1        
+  geom_solref           0.02      1        
+  geom_solimp           0.9       0.95      0.001     0.5       2        
+  geom_size             0.02      12        0        
+  geom_aabb             0         0         0         0.02      0.02      13       
+  geom_rbound           13       
+  geom_pos              62        0         0        
+  geom_quat             0.71      0        -0.71      0        
+  geom_friction         1         0.1       0.1      
+  geom_margin           0        
+  geom_gap              0        
+  geom_fluid            0         0         0         0         0         0         0         0         0         0         0         0        
+  geom_rgba             0.55      0.2       0.95      1        
+
+GEOM 7:
+  name                  rail_magenta
+  geom_type             3 
+  geom_contype          0 
+  geom_conaffinity      1 
+  geom_condim           3 
+  geom_bodyid           0 
+  geom_dataid           -1 
+  geom_matid            -1 
+  geom_group            0 
+  geom_priority         0 
+  geom_plugin           -1 
+  geom_sameframe        0 
+  geom_solmix           1        
+  geom_solref           0.02      1        
+  geom_solimp           0.9       0.95      0.001     0.5       2        
+  geom_size             0.02      12        0        
+  geom_aabb             0         0         0         0.02      0.02      13       
+  geom_rbound           13       
+  geom_pos              88        0         0        
+  geom_quat             0.71      0        -0.71      0        
+  geom_friction         1         0.1       0.1      
+  geom_margin           0        
+  geom_gap              0        
+  geom_fluid            0         0         0         0         0         0         0         0         0         0         0         0        
+  geom_rgba             0.95      0.1       0.75      1        
+
+GEOM 8:
+  name                  rail_center_mark
+  geom_type             3 
+  geom_contype          0 
+  geom_conaffinity      1 
+  geom_condim           3 
+  geom_bodyid           0 
+  geom_dataid           -1 
+  geom_matid            -1 
+  geom_group            0 
+  geom_priority         0 
+  geom_plugin           -1 
+  geom_sameframe        0 
+  geom_solmix           1        
+  geom_solref           0.02      1        
+  geom_solimp           0.9       0.95      0.001     0.5       2        
+  geom_size             0.012     0.5       0        
+  geom_aabb             0         0         0         0.012     0.012     0.51     
+  geom_rbound           0.51     
+  geom_pos              0         0         0.04     
+  geom_quat             0.71      0        -0.71      0        
+  geom_friction         1         0.1       0.1      
+  geom_margin           0        
+  geom_gap              0        
+  geom_fluid            0         0         0         0         0         0         0         0         0         0         0         0        
+  geom_rgba             1         1         1         1        
+
+GEOM 9:
+  name                  cart
+  geom_type             3 
+  geom_contype          0 
+  geom_conaffinity      1 
+  geom_condim           3 
+  geom_bodyid           1 
+  geom_dataid           -1 
+  geom_matid            -1 
+  geom_group            0 
+  geom_priority         0 
+  geom_plugin           -1 
+  geom_sameframe        2 
+  geom_solmix           1        
+  geom_solref           0.02      1        
+  geom_solimp           0.9       0.95      0.001     0.5       2        
+  geom_size             0.1       0.1       0        
+  geom_aabb             0         0         0         0.1       0.1       0.2      
+  geom_rbound           0.2      
+  geom_pos              0         0         0        
+  geom_quat             0.71      0         0.71      0        
+  geom_friction         1         0.1       0.1      
+  geom_margin           0        
+  geom_gap              0        
+  geom_fluid            0         0         0         0         0         0         0         0         0         0         0         0        
+  geom_rgba             0.7       0.7       0         1        
+
+GEOM 10:
+  name                  cpole
+  geom_type             3 
+  geom_contype          0 
+  geom_conaffinity      1 
+  geom_condim           3 
+  geom_bodyid           2 
+  geom_dataid           -1 
+  geom_matid            -1 
+  geom_group            0 
+  geom_priority         0 
+  geom_plugin           -1 
+  geom_sameframe        2 
+  geom_solmix           1        
+  geom_solref           0.02      1        
+  geom_solimp           0.9       0.95      0.001     0.5       2        
+  geom_size             0.049     0.3       0        
+  geom_aabb             0         0         0         0.049     0.049     0.35     
+  geom_rbound           0.35     
+  geom_pos              0.0005    0         0.3      
+  geom_quat             0.00083  -0        -1         0        
+  geom_friction         1         0.1       0.1      
+  geom_margin           0        
+  geom_gap              0        
+  geom_fluid            0         0         0         0         0         0         0         0         0         0         0         0        
+  geom_rgba             0         0.7       0.7       1        
+
+
+CAMERA 0:
+  name                  track_cart
+  cam_mode              2 
+  cam_bodyid            1 
+  cam_targetbodyid      -1 
+  cam_pos               0        -4         1.2      
+  cam_quat              0.71      0.71      0         0        
+  cam_poscom0          -0.00016  -4         1.1      
+  cam_pos0              0        -4         1.2      
+  cam_mat0              1         0         0         0         2.2e-16  -1         0         1         2.2e-16  
+  cam_orthographic      0 
+  cam_fovy              45       
+  cam_ipd               0.068    
+  cam_resolution        1  1 
+  cam_sensorsize        0         0        
+  cam_intrinsic         0.01      0.01      0         0        
+
+
+ACTUATOR 0:
+  name                  slide
+  actuator_trntype      0 
+  actuator_dyntype      0 
+  actuator_gaintype     0 
+  actuator_biastype     0 
+  actuator_trnid        0  -1 
+  actuator_actadr       -1 
+  actuator_actnum       0 
+  actuator_group        0 
+  actuator_ctrllimited  1 
+  actuator_forcelimited 0 
+  actuator_actlimited   0 
+  actuator_dynprm       1         0         0         0         0         0         0         0         0         0        
+  actuator_gainprm      1         0         0         0         0         0         0         0         0         0        
+  actuator_biasprm      0         0         0         0         0         0         0         0         0         0        
+  actuator_actearly     0 
+  actuator_ctrlrange   -10        10       
+  actuator_forcerange   0         0        
+  actuator_actrange     0         0        
+  actuator_gear         1e+02     0         0         0         0         0        
+  actuator_cranklength  0        
+  actuator_acc0         21       
+  actuator_length0      0        
+  actuator_lengthrange  0         0        
+  actuator_plugin       -1 
+
+BVH:
+  id      depth   nodeid  child[0]  child[1]
+  0       0       -1       1         8
+  1       1       -1       2         5
+  2       2       -1       3         4
+  3       3        0      -1        -1
+  4       3        1      -1        -1
+  5       2       -1       6         7
+  6       3        2      -1        -1
+  7       3        3      -1        -1
+  8       1       -1       9         12
+  9       2       -1       10        11
+  10      3        8      -1        -1
+  11      3        4      -1        -1
+  12      2       -1       13        14
+  13      3        5      -1        -1
+  14      3       -1       15        16
+  15      4        6      -1        -1
+  16      4        7      -1        -1
+  17      0        9      -1        -1
+  18      0        10     -1        -1
+

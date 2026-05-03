@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+import math
 import os
 from pathlib import Path
 import sys
@@ -33,10 +34,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-cart",
         type=str,
-        choices=("zero", "current"),
-        default="zero",
-        help="Use cart position target 0 for swing-up, or keep the current cart position.",
+        choices=("zero", "current", "sine"),
+        default="sine",
+        help="Cart position target: fixed 0, current position, or sinusoidal x over time.",
     )
+    parser.add_argument("--target-x-amplitude", type=float, default=1.0, help="Amplitude for sine cart target.")
+    parser.add_argument("--target-x-frequency", type=float, default=1.0, help="Frequency in Hz for sine cart target.")
+    parser.add_argument("--target-x-phase", type=float, default=0.0, help="Phase in radians for sine cart target.")
+    parser.add_argument("--target-x-offset", type=float, default=0.0, help="Offset for sine cart target.")
     parser.add_argument(
         "--inference-mode",
         type=str,
@@ -121,10 +126,37 @@ def load_model_and_stats(args: argparse.Namespace, action_dim: int, device: torc
     return model, ckpt["obs_mean"], ckpt["obs_std"]
 
 
-def build_dynamic_target_features(obs: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+def get_env_time(env, step_index: int) -> float:
+    """Read simulator time, falling back to step_index * timestep if needed."""
+    data = getattr(env.unwrapped, "data", None)
+    sim_time = getattr(data, "time", None)
+    if sim_time is not None:
+        return float(sim_time)
+
+    model = getattr(env.unwrapped, "model", None)
+    timestep = getattr(getattr(model, "opt", None), "timestep", None)
+    if timestep is not None:
+        return float(step_index) * float(timestep)
+    return float(step_index)
+
+
+def target_cart_state(obs: np.ndarray, elapsed_time: float, args: argparse.Namespace) -> tuple[float, float]:
+    """Return target cart position and velocity."""
+    if args.target_cart == "current":
+        return float(obs[0]), 0.0
+    if args.target_cart == "sine":
+        omega = 2.0 * math.pi * args.target_x_frequency
+        angle = omega * elapsed_time + args.target_x_phase
+        cart_pos = args.target_x_offset + args.target_x_amplitude * math.sin(angle)
+        cart_vel = args.target_x_amplitude * omega * math.cos(angle)
+        return cart_pos, cart_vel
+    return 0.0, 0.0
+
+
+def build_dynamic_target_features(obs: np.ndarray, elapsed_time: float, args: argparse.Namespace) -> np.ndarray:
     """Build the swing-up target in feature space."""
-    cart_pos = float(obs[0]) if args.target_cart == "current" else 0.0
-    return upright_feature_target(obs, cart_pos=cart_pos, cart_vel=0.0, pole_ang_vel=0.0)
+    cart_pos, cart_vel = target_cart_state(obs, elapsed_time, args)
+    return upright_feature_target(obs, cart_pos=cart_pos, cart_vel=cart_vel, pole_ang_vel=0.0)
 
 
 def prepare_planner_inputs(
@@ -374,7 +406,8 @@ def run_episode(
                 norm_obs = normalize_obs(norm_obs, obs_mean, obs_std)
             obs_t = torch.as_tensor(norm_obs, dtype=torch.float32, device=device)
 
-            goal_features = build_dynamic_target_features(obs, args)
+            elapsed_time = get_env_time(env, ep_len)
+            goal_features = build_dynamic_target_features(obs, elapsed_time, args)
             norm_goal = goal_features
             if use_normalize:
                 norm_goal = normalize_obs(norm_goal, obs_mean, obs_std)
@@ -399,11 +432,12 @@ def run_episode(
             action = action_t.detach().cpu().numpy()
 
             obs, reward, terminated, truncated, _ = env.step(action)
-            time.sleep(0.08)  # Small sleep to improve rendering smoothness; adjust as needed.
+            time.sleep(0.03)  # Small sleep to improve rendering smoothness; adjust as needed.
             ep_return += float(reward)
             ep_len += 1
             if args.log_every > 0 and ep_len % args.log_every == 0:
-                print(format_obs_state("obs", obs))
+                target_x, target_xdot = target_cart_state(obs, get_env_time(env, ep_len), args)
+                print(f"{format_obs_state('obs', obs)}, target_x={target_x:.4f}, target_xdot={target_xdot:.4f}")
 
             should_render = args.render_every > 0 and ep_len % args.render_every == 0
             if viewer is not None and should_render:
@@ -450,6 +484,12 @@ def main() -> None:
         f"target=upright_features_cart_{args.target_cart}, action_cost={args.action_cost}, "
         f"num_sequences={args.num_sequences}, horizon={args.horizon}"
     )
+    if args.target_cart == "sine":
+        print(
+            "target sine: "
+            f"x={args.target_x_offset}+{args.target_x_amplitude}*sin("
+            f"2*pi*{args.target_x_frequency}*t+{args.target_x_phase})"
+        )
     if args.render:
         print(
             f"render: backend={args.render_backend}, render_every={args.render_every}, "

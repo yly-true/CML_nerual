@@ -54,14 +54,14 @@ Windows PowerShell：
 
 ```powershell
 $ckpt = Get-ChildItem runs\InvertedPendulum_v5 -Recurse -Filter model_30000.pt | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
-python evaluate.py --checkpoint $ckpt --env-id InvertedPendulum-v5 --xml-file inverted_pendulum_v5.xml --episodes 1 --device cuda --render --init-cart-pos 0.0 --init-pole-angle 3.14159 --init-cart-vel 0.0 --init-pole-ang-vel 0.0 --inference-mode obsend --target-cart zero --num-sequences 20000 --horizon 10 --obs-cost-weights 0.2 10.0 10.0 0.1 0.5
+python evaluate.py --checkpoint "$ckpt" --env-id InvertedPendulum-v5 --xml-file inverted_pendulum_v5.xml --episodes 1 --device cuda --render --init-cart-pos 0.0 --init-pole-angle 0 --init-cart-vel 0.0 --init-pole-ang-vel 0.0 --inference-mode obsend --target-cart sine --target-x-amplitude 1.0 --target-x-frequency 0.6 --num-sequences 40000 --horizon 10 --obs-cost-weights 1.0 0.5 0.5 0.2 0.2
 ```
 
 Linux/macOS bash：
 
 ```bash
 ckpt=$(find runs/InvertedPendulum_v5 -name 'model_30000.pt' -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-)
-python evaluate.py --checkpoint "$ckpt" --env-id InvertedPendulum-v5 --xml-file inverted_pendulum_v5.xml --episodes 1 --device cuda --render --init-cart-pos 0.0 --init-pole-angle 3.14159 --init-cart-vel 0.0 --init-pole-ang-vel 0.0 --inference-mode obsend --target-cart zero --num-sequences 20000 --horizon 10 --obs-cost-weights 0.2 10.0 10.0 0.1 0.5
+python evaluate.py --checkpoint "$ckpt" --env-id InvertedPendulum-v5 --xml-file inverted_pendulum_v5.xml --episodes 1 --device cuda --render --init-cart-pos 0.0 --init-pole-angle 3.14159 --init-cart-vel 0.0 --init-pole-ang-vel 0.0 --inference-mode obsend --target-cart sine --target-x-amplitude 1.0 --target-x-frequency 0.1 --num-sequences 20000 --horizon 10 --obs-cost-weights 0.2 10.0 10.0 0.1 0.5
 ```
 
 评估加载 checkpoint 后也会打印模型大小，方便确认当前使用的是哪个结构。
@@ -73,7 +73,11 @@ python evaluate.py --checkpoint "$ckpt" --env-id InvertedPendulum-v5 --xml-file 
 - `--num-sequences`: random shooting 候选动作序列数量
 - `--horizon`: 每条候选动作序列长度
 - `--obs-cost-weights`: 按 `[x, sin(theta), cos(theta), xdot, thetadot]` 设置观测代价权重
-- `--target-cart`: `zero` 固定目标车位置为 0，`current` 使用当前车位置
+- `--target-cart`: `sine` 让目标车位置按正弦随时间振荡；也可用 `zero` 固定为 0，或 `current` 使用当前车位置
+- `--target-x-amplitude`: 正弦目标幅值，默认 `1.0`
+- `--target-x-frequency`: 正弦目标频率，单位 Hz，默认 `0.1`
+- `--target-x-phase`: 正弦目标相位，单位 rad，默认 `0.0`
+- `--target-x-offset`: 正弦目标偏置，默认 `0.0`
 
 常用权重：
 
