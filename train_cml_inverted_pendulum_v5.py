@@ -20,12 +20,12 @@ from tqdm import trange
 
 from cml_model import NeuralCML
 from replay_buffer import ReplayBuffer
+from tasks import feature_dim, obs_to_features, reset_train_env, resolve_env_id, resolve_task_name
 from utils import (
     compute_obs_stats,
     get_dims,
     make_env,
     normalize_replay_buffer,
-    pendulum_obs_to_features,
     resolve_device,
     save_checkpoint,
 )
@@ -33,16 +33,26 @@ from utils import (
 
 def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
-    parser = argparse.ArgumentParser(description="训练 InvertedPendulum-v5 上的 Neural CML")
-    default_xml = str((Path(__file__).resolve().parent / "inverted_pendulum_v5.xml"))
-    parser.add_argument("--env-id", type=str, default="InvertedPendulum-v5")
-    parser.add_argument("--xml-file", type=str, default=default_xml)
+    parser = argparse.ArgumentParser(description="训练 Gymnasium control tasks 上的 Neural CML")
+    parser.add_argument(
+        "--task",
+        type=str,
+        choices=("auto", "inverted_pendulum", "mountain_car_continuous", "pendulum"),
+        default="auto",
+    )
+    parser.add_argument("--env-id", type=str, default=None)
+    parser.add_argument("--xml-file", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--total-env-steps", type=int, default=50_000)
     parser.add_argument("--buffer-size", type=int, default=100_000)
     parser.add_argument("--random-cart-pos-range", type=float, default=2.0)
     parser.add_argument("--random-cart-vel-range", type=float, default=4.0)
     parser.add_argument("--random-pole-ang-vel-range", type=float, default=8.0)
+    parser.add_argument("--random-mountain-car-pos-low", type=float, default=-1.2)
+    parser.add_argument("--random-mountain-car-pos-high", type=float, default=0.6)
+    parser.add_argument("--random-mountain-car-vel-range", type=float, default=0.07)
+    parser.add_argument("--random-pendulum-theta-range", type=float, default=np.pi)
+    parser.add_argument("--random-pendulum-ang-vel-range", type=float, default=8.0)
     parser.add_argument("--updates", type=int, default=30_000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--latent-dim", type=int, default=64)
@@ -58,6 +68,15 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_xml_file(args: argparse.Namespace, task_name: str) -> str | None:
+    """Use the custom inverted-pendulum XML by default only for that task."""
+    if args.xml_file is not None:
+        return args.xml_file
+    if task_name == "inverted_pendulum":
+        return str((Path(__file__).resolve().parent / "inverted_pendulum_v5.xml"))
+    return None
+
+
 def set_seed(seed: int) -> None:
     """固定随机种子，尽量提高结果可复现性。"""
     random.seed(seed)
@@ -65,29 +84,14 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
 
 
-def reset_full_angle_state(
+def collect_random_data(
     env,
-    cart_pos_range: float,
-    cart_vel_range: float,
-    pole_ang_vel_range: float,
-) -> np.ndarray:
-    """Reset to a random full-angle state for swing-up dynamics learning."""
-    env.reset()
-    sim = env.unwrapped
-    if not hasattr(sim, "set_state"):
-        raise RuntimeError("Current environment does not expose set_state(qpos, qvel).")
-
-    qpos = np.array(sim.data.qpos, dtype=np.float64, copy=True)
-    qvel = np.array(sim.data.qvel, dtype=np.float64, copy=True)
-    qpos[0] = np.random.uniform(-cart_pos_range, cart_pos_range)
-    qpos[1] = np.random.uniform(-np.pi, np.pi)
-    qvel[0] = np.random.uniform(-cart_vel_range, cart_vel_range)
-    qvel[1] = np.random.uniform(-pole_ang_vel_range, pole_ang_vel_range)
-    sim.set_state(qpos, qvel)
-    return sim._get_obs().astype(np.float32)
-
-
-def collect_random_data(env, buffer: ReplayBuffer, steps: int, seed: int, args: argparse.Namespace) -> None:
+    buffer: ReplayBuffer,
+    steps: int,
+    seed: int,
+    args: argparse.Namespace,
+    task_name: str,
+) -> None:
     """通过随机动作采集自监督训练数据。
 
     这里直接在函数内显式指定采样方式：
@@ -102,13 +106,7 @@ def collect_random_data(env, buffer: ReplayBuffer, steps: int, seed: int, args: 
     default_std = np.maximum((action_high - action_low) / 6.0, 1e-6)
     gaussian_std = default_std
 
-    env.reset(seed=seed)
-    obs = reset_full_angle_state(
-        env,
-        args.random_cart_pos_range,
-        args.random_cart_vel_range,
-        args.random_pole_ang_vel_range,
-    )
+    obs = reset_train_env(task_name, env, args, seed=seed)
     for _ in trange(steps, desc="Collecting random transitions"):
         if use_gaussian:
             action = np.random.normal(loc=gaussian_mean, scale=gaussian_std).astype(np.float32)
@@ -118,19 +116,14 @@ def collect_random_data(env, buffer: ReplayBuffer, steps: int, seed: int, args: 
         next_obs, _, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
         buffer.add(
-            pendulum_obs_to_features(obs),
+            obs_to_features(task_name, obs),
             action,
-            pendulum_obs_to_features(next_obs),
+            obs_to_features(task_name, next_obs),
             done,
         )
         obs = next_obs
         if done:
-            obs = reset_full_angle_state(
-                env,
-                args.random_cart_pos_range,
-                args.random_cart_vel_range,
-                args.random_pole_ang_vel_range,
-            )
+            obs = reset_train_env(task_name, env, args)
 
 
 def build_model(args: argparse.Namespace, obs_dim: int, action_dim: int, device: torch.device) -> NeuralCML:
@@ -192,13 +185,16 @@ def train_model(
 
 def prepare_dataset(args: argparse.Namespace):
     """创建环境、采样数据并完成标准化。"""
+    task_name = resolve_task_name(args.task, args.env_id)
+    args.task = task_name
+    args.env_id = resolve_env_id(task_name, args.env_id)
+    args.xml_file = resolve_xml_file(args, task_name)
+
     env = make_env(args.env_id, xml_file=args.xml_file)
     raw_obs_dim, action_dim = get_dims(env)
-    if raw_obs_dim < 4:
-        raise ValueError("Swing-up feature conversion expects raw obs [x, theta, xdot, thetadot].")
-    obs_dim = 5
+    obs_dim = feature_dim(task_name, raw_obs_dim)
     buffer = ReplayBuffer(obs_dim, action_dim, args.buffer_size)
-    collect_random_data(env, buffer, args.total_env_steps, args.seed, args)
+    collect_random_data(env, buffer, args.total_env_steps, args.seed, args, task_name)
 
     use_normalize = True
     if use_normalize:

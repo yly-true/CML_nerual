@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
-import math
 import os
 from pathlib import Path
 import sys
@@ -15,22 +14,45 @@ import numpy as np
 import torch
 
 from cml_model import NeuralCML, plan_action_random_shooting
-from utils import get_dims, make_env, normalize_obs, pendulum_obs_to_features, resolve_device, upright_feature_target
+from tasks import (
+    feature_dim,
+    feature_names,
+    format_obs,
+    obs_to_features,
+    reset_eval_env,
+    resolve_env_id,
+    resolve_task_name,
+    supports_passive_mujoco_viewer,
+    target_features,
+)
+from utils import get_dims, make_env, normalize_obs, resolve_device
 
 
 def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
-    parser = argparse.ArgumentParser(description="评估 InvertedPendulum-v5 上的 Neural CML")
+    parser = argparse.ArgumentParser(description="评估 Gymnasium control tasks 上的 Neural CML")
     parser.add_argument("--checkpoint", type=str, required=True)
-    default_xml = str((Path(__file__).resolve().parent / "inverted_pendulum_v5.xml"))
-    parser.add_argument("--env-id", type=str, default="InvertedPendulum-v5")
-    parser.add_argument("--xml-file", type=str, default=default_xml)
+    parser.add_argument(
+        "--task",
+        type=str,
+        choices=("auto", "inverted_pendulum", "mountain_car_continuous", "pendulum"),
+        default="auto",
+    )
+    parser.add_argument("--env-id", type=str, default=None)
+    parser.add_argument("--xml-file", type=str, default=None)
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--num-sequences", type=int, default=2048*4)
     parser.add_argument("--horizon", type=int, default=5)
     parser.add_argument("--action-cost", type=float, default=0)
     parser.add_argument("--action-sampling", type=str, choices=("uniform", "gaussian"), default="gaussian")
+    parser.add_argument(
+        "--action-std",
+        type=float,
+        nargs="*",
+        default=None,
+        help="Gaussian action sampling std. Provide one value or one per action dimension. Defaults to action range / 4.",
+    )
     parser.add_argument(
         "--target-cart",
         type=str,
@@ -39,9 +61,12 @@ def parse_args() -> argparse.Namespace:
         help="Cart position target: fixed 0, current position, or sinusoidal x over time.",
     )
     parser.add_argument("--target-x-amplitude", type=float, default=1.0, help="Amplitude for sine cart target.")
-    parser.add_argument("--target-x-frequency", type=float, default=1.0, help="Frequency in Hz for sine cart target.")
+    parser.add_argument("--target-x-frequency", type=float, default=0.1, help="Frequency in Hz for sine cart target.")
     parser.add_argument("--target-x-phase", type=float, default=0.0, help="Phase in radians for sine cart target.")
     parser.add_argument("--target-x-offset", type=float, default=0.0, help="Offset for sine cart target.")
+    parser.add_argument("--target-position", type=float, default=0.45, help="MountainCar target position.")
+    parser.add_argument("--target-velocity", type=float, default=0.0, help="MountainCar target velocity.")
+    parser.add_argument("--target-angular-velocity", type=float, default=0.0, help="Pendulum target angular velocity.")
     parser.add_argument(
         "--inference-mode",
         type=str,
@@ -54,7 +79,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         nargs="*",
         default=None,
-        help="Optional feature weights: [x, sin(theta), cos(theta), xdot, thetadot].",
+        help="Optional feature weights in the selected task's feature order.",
     )
     parser.add_argument("--init-cart-pos", type=float, default=0)
     parser.add_argument("--init-pole-angle", type=float, default=3.14)
@@ -75,6 +100,15 @@ def parse_args() -> argparse.Namespace:
         help="Use Gymnasium human rendering by default; passive keeps the MuJoCo passive viewer path.",
     )
     return parser.parse_args()
+
+
+def resolve_xml_file(args: argparse.Namespace, task_name: str) -> str | None:
+    """Use the custom inverted-pendulum XML by default only for that task."""
+    if args.xml_file is not None:
+        return args.xml_file
+    if task_name == "inverted_pendulum":
+        return str((Path(__file__).resolve().parent / "inverted_pendulum_v5.xml"))
+    return None
 
 
 def objective_from_inference_mode(inference_mode: str) -> str:
@@ -107,12 +141,6 @@ def load_model_and_stats(args: argparse.Namespace, action_dim: int, device: torc
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model_args = ckpt["args"]
     obs_dim = int(np.asarray(ckpt["obs_mean"]).shape[0])
-    if obs_dim != 5:
-        raise ValueError(
-            "This swing-up evaluator expects a checkpoint trained with 5-D features "
-            "[x, sin(theta), cos(theta), xdot, thetadot]. Retrain with the current "
-            "train_cml_inverted_pendulum_v5.py."
-        )
     model = NeuralCML(
         obs_dim=obs_dim,
         action_dim=action_dim,
@@ -140,23 +168,14 @@ def get_env_time(env, step_index: int) -> float:
     return float(step_index)
 
 
-def target_cart_state(obs: np.ndarray, elapsed_time: float, args: argparse.Namespace) -> tuple[float, float]:
-    """Return target cart position and velocity."""
-    if args.target_cart == "current":
-        return float(obs[0]), 0.0
-    if args.target_cart == "sine":
-        omega = 2.0 * math.pi * args.target_x_frequency
-        angle = omega * elapsed_time + args.target_x_phase
-        cart_pos = args.target_x_offset + args.target_x_amplitude * math.sin(angle)
-        cart_vel = args.target_x_amplitude * omega * math.cos(angle)
-        return cart_pos, cart_vel
-    return 0.0, 0.0
-
-
-def build_dynamic_target_features(obs: np.ndarray, elapsed_time: float, args: argparse.Namespace) -> np.ndarray:
+def build_dynamic_target_features(
+    task_name: str,
+    obs: np.ndarray,
+    elapsed_time: float,
+    args: argparse.Namespace,
+) -> np.ndarray:
     """Build the swing-up target in feature space."""
-    cart_pos, cart_vel = target_cart_state(obs, elapsed_time, args)
-    return upright_feature_target(obs, cart_pos=cart_pos, cart_vel=cart_vel, pole_ang_vel=0.0)
+    return target_features(task_name, obs, elapsed_time, args)
 
 
 def prepare_planner_inputs(
@@ -177,18 +196,32 @@ def prepare_planner_inputs(
         if len(args.obs_cost_weights) != obs_dim:
             raise ValueError(f"--obs-cost-weights must contain {obs_dim} values for this environment.")
         obs_weights_t = torch.as_tensor(args.obs_cost_weights, dtype=torch.float32, device=device)
+    action_std_t = None
+    if args.action_std is not None:
+        if len(args.action_std) == 0:
+            raise ValueError("--action-std requires at least one value.")
+        if len(args.action_std) == 1:
+            action_std = np.full(action_low.shape, args.action_std[0], dtype=np.float32)
+        elif len(args.action_std) == action_low.numel():
+            action_std = np.asarray(args.action_std, dtype=np.float32)
+        else:
+            raise ValueError(f"--action-std must contain 1 or {action_low.numel()} values.")
+        if np.any(action_std < 0):
+            raise ValueError("--action-std values must be non-negative.")
+        action_std_t = torch.as_tensor(action_std, dtype=torch.float32, device=device)
     return SimpleNamespace(
         action_low=action_low,
         action_high=action_high,
         obs_mean_t=obs_mean_t,
         obs_std_t=obs_std_t,
         obs_weights_t=obs_weights_t,
+        action_std_t=action_std_t,
     )
 
 
-def maybe_launch_mujoco_viewer(env, args: argparse.Namespace):
+def maybe_launch_mujoco_viewer(env, args: argparse.Namespace, task_name: str):
     """按需启动 MuJoCo 官方被动 viewer。"""
-    if not args.render or args.render_backend != "passive":
+    if not args.render or args.render_backend != "passive" or not supports_passive_mujoco_viewer(task_name):
         return nullcontext(None)
 
     try:
@@ -232,6 +265,8 @@ def maybe_configure_passive_camera(env, viewer, args: argparse.Namespace) -> Non
 
 def maybe_configure_human_camera(env, args: argparse.Namespace) -> None:
     """Configure Gymnasium's human viewer camera after the viewer is created."""
+    if not hasattr(env.unwrapped, "model"):
+        return
     renderer = getattr(env.unwrapped, "mujoco_renderer", None)
     viewer = getattr(renderer, "viewer", None)
     configure_named_camera(env.unwrapped.model, getattr(viewer, "cam", None), args.camera_name)
@@ -248,48 +283,6 @@ def maybe_sleep_after_render(args: argparse.Namespace) -> None:
     """Optional render pacing; default is no sleep for faster visualization."""
     if args.render_sleep > 0:
         time.sleep(args.render_sleep)
-
-
-def format_obs_state(prefix: str, obs: np.ndarray) -> str:
-    """Format InvertedPendulum observation values for logs."""
-    obs = obs.astype(np.float32)
-    if obs.shape[0] >= 4:
-        return (
-            f"{prefix}: "
-            f"cart_pos={obs[0]:.4f}, "
-            f"pole_angle={obs[1]:.4f}, "
-            f"cart_vel={obs[2]:.4f}, "
-            f"pole_ang_vel={obs[3]:.4f}"
-        )
-    return f"{prefix}: obs={obs}"
-
-
-def maybe_set_initial_state(env, args: argparse.Namespace) -> None:
-    """按命令行参数覆盖环境初始状态。"""
-    overrides = (
-        args.init_cart_pos,
-        args.init_pole_angle,
-        args.init_cart_vel,
-        args.init_pole_ang_vel,
-    )
-    if all(value is None for value in overrides):
-        return
-
-    sim = env.unwrapped
-    if not hasattr(sim, "set_state"):
-        raise RuntimeError("Current environment does not expose set_state(qpos, qvel).")
-
-    qpos = np.array(sim.data.qpos, dtype=np.float64, copy=True)
-    qvel = np.array(sim.data.qvel, dtype=np.float64, copy=True)
-    if args.init_cart_pos is not None:
-        qpos[0] = args.init_cart_pos
-    if args.init_pole_angle is not None:
-        qpos[1] = args.init_pole_angle
-    if args.init_cart_vel is not None:
-        qvel[0] = args.init_cart_vel
-    if args.init_pole_ang_vel is not None:
-        qvel[1] = args.init_pole_ang_vel
-    sim.set_state(qpos, qvel)
 
 
 class TerminalKeyListener:
@@ -360,12 +353,10 @@ class TerminalKeyListener:
         return any(key == self.reset_key for key in self._read_available_keys())
 
 
-def reset_env_to_initial_state(env, args: argparse.Namespace, viewer=None) -> np.ndarray:
+def reset_env_to_initial_state(env, args: argparse.Namespace, task_name: str, viewer=None) -> np.ndarray:
     """Reset environment and reapply command-line initial state overrides."""
-    env.reset()
-    maybe_set_initial_state(env, args)
-    obs = env.unwrapped._get_obs()
-    print(format_obs_state("reset_obs", obs))
+    obs = reset_eval_env(task_name, env, args)
+    print(format_obs(task_name, "reset_obs", obs))
     if viewer is not None:
         maybe_configure_passive_camera(env, viewer, args)
         viewer.sync()
@@ -378,6 +369,7 @@ def run_episode(
     env,
     model: NeuralCML,
     planner_inputs,
+    task_name: str,
     obs_mean,
     obs_std,
     args: argparse.Namespace,
@@ -386,8 +378,8 @@ def run_episode(
     viewer,
 ) -> tuple[float, int]:
     """执行一条评估 episode。"""
-    obs = reset_env_to_initial_state(env, args, viewer)
-    print(format_obs_state("initial_obs", obs))
+    obs = reset_env_to_initial_state(env, args, task_name, viewer)
+    print(format_obs(task_name, "initial_obs", obs))
     ep_return = 0.0
     ep_len = 0
 
@@ -397,17 +389,17 @@ def run_episode(
                 break
 
             if key_listener.reset_requested():
-                obs = reset_env_to_initial_state(env, args, viewer)
+                obs = reset_env_to_initial_state(env, args, task_name, viewer)
                 continue
 
-            obs_features = pendulum_obs_to_features(obs)
+            obs_features = obs_to_features(task_name, obs)
             norm_obs = obs_features.astype(np.float32)
             if use_normalize:
                 norm_obs = normalize_obs(norm_obs, obs_mean, obs_std)
             obs_t = torch.as_tensor(norm_obs, dtype=torch.float32, device=device)
 
             elapsed_time = get_env_time(env, ep_len)
-            goal_features = build_dynamic_target_features(obs, elapsed_time, args)
+            goal_features = build_dynamic_target_features(task_name, obs, elapsed_time, args)
             norm_goal = goal_features
             if use_normalize:
                 norm_goal = normalize_obs(norm_goal, obs_mean, obs_std)
@@ -424,6 +416,7 @@ def run_episode(
                 horizon=args.horizon,
                 action_cost=args.action_cost,
                 sampling_dist=args.action_sampling,
+                action_std=planner_inputs.action_std_t,
                 objective=objective,
                 obs_mean=planner_inputs.obs_mean_t,
                 obs_std=planner_inputs.obs_std_t,
@@ -436,8 +429,8 @@ def run_episode(
             ep_return += float(reward)
             ep_len += 1
             if args.log_every > 0 and ep_len % args.log_every == 0:
-                target_x, target_xdot = target_cart_state(obs, get_env_time(env, ep_len), args)
-                print(f"{format_obs_state('obs', obs)}, target_x={target_x:.4f}, target_xdot={target_xdot:.4f}")
+                target = target_features(task_name, obs, get_env_time(env, ep_len), args)
+                print(f"{format_obs(task_name, 'obs', obs)}, target={target}")
 
             should_render = args.render_every > 0 and ep_len % args.render_every == 0
             if viewer is not None and should_render:
@@ -456,15 +449,24 @@ def run_episode(
 
 def main() -> None:
     args = parse_args()
+    task_name = resolve_task_name(args.task, args.env_id)
+    args.task = task_name
+    args.env_id = resolve_env_id(task_name, args.env_id)
+    args.xml_file = resolve_xml_file(args, task_name)
+
     device = resolve_device(args.device)
     use_normalize = True
-    render_mode = "human" if args.render and args.render_backend == "human" else None
+    render_mode = "human" if args.render and (args.render_backend == "human" or not supports_passive_mujoco_viewer(task_name)) else None
     env = make_env(args.env_id, render_mode=render_mode, xml_file=args.xml_file)
     raw_obs_dim, action_dim = get_dims(env)
-    if raw_obs_dim < 4:
-        raise ValueError("Swing-up evaluation expects raw obs [x, theta, xdot, thetadot].")
+    expected_obs_dim = feature_dim(task_name, raw_obs_dim)
     model, obs_mean, obs_std = load_model_and_stats(args, action_dim, device)
     obs_dim = int(np.asarray(obs_mean).shape[0])
+    if obs_dim != expected_obs_dim:
+        raise ValueError(
+            f"Checkpoint obs_dim={obs_dim} does not match task={task_name} feature_dim={expected_obs_dim}. "
+            "Train a checkpoint for the selected task."
+        )
     if use_normalize:
         planner_inputs = prepare_planner_inputs(env, obs_dim, obs_mean, obs_std, device, args)
     else:
@@ -479,17 +481,22 @@ def main() -> None:
 
     print(
         "inference: "
-        f"mode={args.inference_mode}, planner=random, "
+        f"task={task_name}, env_id={args.env_id}, mode={args.inference_mode}, planner=random, "
         f"objective={objective_from_inference_mode(args.inference_mode)}, "
-        f"target=upright_features_cart_{args.target_cart}, action_cost={args.action_cost}, "
+        f"features={feature_names(task_name)}, action_cost={args.action_cost}, "
+        f"action_sampling={args.action_sampling}, action_std={args.action_std}, "
         f"num_sequences={args.num_sequences}, horizon={args.horizon}"
     )
-    if args.target_cart == "sine":
+    if task_name == "inverted_pendulum" and args.target_cart == "sine":
         print(
             "target sine: "
             f"x={args.target_x_offset}+{args.target_x_amplitude}*sin("
             f"2*pi*{args.target_x_frequency}*t+{args.target_x_phase})"
         )
+    elif task_name == "mountain_car_continuous":
+        print(f"target mountain_car: position={args.target_position}, velocity={args.target_velocity}")
+    elif task_name == "pendulum":
+        print(f"target pendulum: cos(theta)=1.0, sin(theta)=0.0, thetadot={args.target_angular_velocity}")
     if args.render:
         print(
             f"render: backend={args.render_backend}, render_every={args.render_every}, "
@@ -500,12 +507,13 @@ def main() -> None:
     returns = []
     lengths = []
 
-    with maybe_launch_mujoco_viewer(env, args) as viewer:
+    with maybe_launch_mujoco_viewer(env, args, task_name) as viewer:
         for ep in range(args.episodes):
             ep_return, ep_len = run_episode(
                 env=env,
                 model=model,
                 planner_inputs=planner_inputs,
+                task_name=task_name,
                 obs_mean=obs_mean,
                 obs_std=obs_std,
                 args=args,

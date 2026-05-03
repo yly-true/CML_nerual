@@ -150,6 +150,7 @@ def sample_action_sequences(
     action_dim: int,
     device: torch.device,
     sampling_dist: str = "gaussian",
+    action_std: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """在动作边界内采样候选动作序列。"""
     shape = (num_sequences, horizon, action_dim)
@@ -162,7 +163,11 @@ def sample_action_sequences(
 
     if sampling_dist == "gaussian":
         mean = torch.zeros(shape, device=device)
-        std = ((action_high - action_low) / 4.0).view(1, 1, action_dim).expand(shape)
+        if action_std is None:
+            std = ((action_high - action_low) / 4.0).view(1, 1, action_dim)
+        else:
+            std = action_std.to(device=device, dtype=torch.float32).view(1, 1, action_dim)
+        std = std.expand(shape)
         actions = torch.normal(mean=mean, std=std)
         return torch.clamp(actions, min=low, max=high)
 
@@ -321,6 +326,7 @@ def plan_action_random_shooting(
     horizon: int = 8,
     action_cost: float = 0.001,
     sampling_dist: str = "gaussian",
+    action_std: torch.Tensor | None = None,
     objective: str = "latent-terminal",
     obs_mean: torch.Tensor | None = None,
     obs_std: torch.Tensor | None = None,
@@ -338,6 +344,7 @@ def plan_action_random_shooting(
         action_dim=action_dim,
         device=device,
         sampling_dist=sampling_dist,
+        action_std=action_std,
     )
     score = score_action_sequences(
         model=model,
