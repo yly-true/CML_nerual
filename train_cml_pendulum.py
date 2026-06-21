@@ -1,4 +1,4 @@
-"""训练 InvertedPendulum-v5 上的 Neural CML 模型。
+"""训练 Pendulum-v1 上的 Neural CML 模型。
 
 整体流程分两步：
 1. 随机探索采集转移数据
@@ -20,7 +20,7 @@ from tqdm import trange
 
 from cml_model import NeuralCML
 from replay_buffer import ReplayBuffer
-from tasks import feature_dim, obs_to_features, reset_train_env, resolve_env_id, resolve_task_name
+from tasks import ENV_ID, feature_dim, obs_to_features, reset_train_env
 from utils import (
     compute_obs_stats,
     get_dims,
@@ -33,48 +33,21 @@ from utils import (
 
 def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
-    parser = argparse.ArgumentParser(description="训练 Gymnasium control tasks 上的 Neural CML")
-    parser.add_argument(
-        "--task",
-        type=str,
-        choices=("auto", "inverted_pendulum", "mountain_car_continuous", "pendulum"),
-        default="auto",
-    )
-    parser.add_argument("--env-id", type=str, default=None)
-    parser.add_argument("--xml-file", type=str, default=None)
+    parser = argparse.ArgumentParser(description="训练 Pendulum-v1 上的 Neural CML")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--total-env-steps", type=int, default=50_000)
-    parser.add_argument("--buffer-size", type=int, default=100_000)
-    parser.add_argument("--random-cart-pos-range", type=float, default=2.0)
-    parser.add_argument("--random-cart-vel-range", type=float, default=4.0)
-    parser.add_argument("--random-pole-ang-vel-range", type=float, default=8.0)
-    parser.add_argument("--random-mountain-car-pos-low", type=float, default=-1.2)
-    parser.add_argument("--random-mountain-car-pos-high", type=float, default=0.6)
-    parser.add_argument("--random-mountain-car-vel-range", type=float, default=0.07)
+    parser.add_argument("--total-env-steps", type=int, default=300_000)
+    parser.add_argument("--buffer-size", type=int, default=300_000)
     parser.add_argument("--random-pendulum-theta-range", type=float, default=np.pi)
     parser.add_argument("--random-pendulum-ang-vel-range", type=float, default=8.0)
-    parser.add_argument("--updates", type=int, default=30_000)
+    parser.add_argument("--updates", type=int, default=50_000)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--latent-dim", type=int, default=64)
-    parser.add_argument("--hidden-dim", type=int, default=32)
-    parser.add_argument("--depth", type=int, default=2)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--recon-weight", type=float, default=0.05)
+    parser.add_argument("--recon-weight", type=float, default=0.1)
     parser.add_argument("--action-norm-weight", type=float, default=1e-4)
-    parser.add_argument("--residual-norm-weight", type=float, default=1e-3)
-    parser.add_argument("--save-every", type=int, default=1000)
+    parser.add_argument("--save-every", type=int, default=5000)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--run-dir", type=str, default="runs")
     return parser.parse_args()
-
-
-def resolve_xml_file(args: argparse.Namespace, task_name: str) -> str | None:
-    """Use the custom inverted-pendulum XML by default only for that task."""
-    if args.xml_file is not None:
-        return args.xml_file
-    if task_name == "inverted_pendulum":
-        return str((Path(__file__).resolve().parent / "inverted_pendulum_v5.xml"))
-    return None
 
 
 def set_seed(seed: int) -> None:
@@ -90,25 +63,18 @@ def collect_random_data(
     steps: int,
     seed: int,
     args: argparse.Namespace,
-    task_name: str,
 ) -> None:
-    """通过随机动作采集自监督训练数据。
-
-    这里直接在函数内显式指定采样方式：
-    - use_gaussian = False: 使用均匀采样
-    - use_gaussian = True: 使用高斯采样
-    """
+    """通过混合随机动作采集自监督训练数据。"""
     action_low = np.asarray(env.action_space.low, dtype=np.float32)
     action_high = np.asarray(env.action_space.high, dtype=np.float32)
 
-    use_gaussian = False
-    gaussian_mean = 0.5 * (action_low + action_high)
-    default_std = np.maximum((action_high - action_low) / 6.0, 1e-6)
-    gaussian_std = default_std
+    gaussian_mean = np.zeros_like(action_low, dtype=np.float32)
+    gaussian_std = np.maximum((action_high - action_low) / 8.0, 1e-6)
+    gaussian_prob = 0.5
 
-    obs = reset_train_env(task_name, env, args, seed=seed)
+    obs = reset_train_env(env, args, seed=seed)
     for _ in trange(steps, desc="Collecting random transitions"):
-        if use_gaussian:
+        if np.random.rand() < gaussian_prob:
             action = np.random.normal(loc=gaussian_mean, scale=gaussian_std).astype(np.float32)
             action = np.clip(action, action_low, action_high)
         else:
@@ -116,25 +82,43 @@ def collect_random_data(
         next_obs, _, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
         buffer.add(
-            obs_to_features(task_name, obs),
+            obs_to_features(obs),
             action,
-            obs_to_features(task_name, next_obs),
+            obs_to_features(next_obs),
             done,
         )
         obs = next_obs
         if done:
-            obs = reset_train_env(task_name, env, args)
+            obs = reset_train_env(env, args)
 
 
 def build_model(args: argparse.Namespace, obs_dim: int, action_dim: int, device: torch.device) -> NeuralCML:
     """按参数构造模型并放到目标设备上。"""
+    _ = args
     return NeuralCML(
-        obs_dim=obs_dim,    #4
-        action_dim=action_dim,   #1
-        latent_dim=args.latent_dim,    #高维向量
-        hidden_dim=args.hidden_dim,    #MLP隐藏层维度
-        depth=args.depth,              #MLP层数
+        obs_dim=obs_dim,
+        action_dim=action_dim,
     ).to(device)
+
+
+def model_config(model: NeuralCML) -> dict[str, object]:
+    """Return the model structure saved with each checkpoint."""
+    return {
+        "latent_dim": model.latent_dim,
+        "hidden_dims": list(model.hidden_dims),
+    }
+
+
+def print_model_size(model: NeuralCML, obs_dim: int, action_dim: int) -> None:
+    """打印当前网络参数，确认 cml_model.py 中的配置已生效。"""
+    total_params = sum(param.numel() for param in model.parameters())
+    param_mb = sum(param.numel() * param.element_size() for param in model.parameters()) / 1024 / 1024
+    print(
+        "Model size: "
+        f"obs_dim={obs_dim}, action_dim={action_dim}, "
+        f"latent_dim={model.latent_dim}, hidden_dims={list(model.hidden_dims)}, "
+        f"params={total_params:,}, param_memory={param_mb:.3f} MB"
+    )
 
 
 def train_model(
@@ -158,7 +142,6 @@ def train_model(
             batch.next_obs,
             recon_weight=args.recon_weight,
             action_norm_weight=args.action_norm_weight,
-            residual_norm_weight=args.residual_norm_weight,
         )
         optimizer.zero_grad(set_to_none=True)
         loss_out.total.backward()   #反向传播，计算梯度
@@ -177,7 +160,7 @@ def train_model(
                 run_dir / f"model_{update_idx}.pt",
                 model,
                 optimizer,
-                vars(args),
+                vars(args) | model_config(model),
                 obs_mean=obs_mean,
                 obs_std=obs_std,
             )
@@ -185,16 +168,12 @@ def train_model(
 
 def prepare_dataset(args: argparse.Namespace):
     """创建环境、采样数据并完成标准化。"""
-    task_name = resolve_task_name(args.task, args.env_id)
-    args.task = task_name
-    args.env_id = resolve_env_id(task_name, args.env_id)
-    args.xml_file = resolve_xml_file(args, task_name)
-
-    env = make_env(args.env_id, xml_file=args.xml_file)
+    args.env_id = ENV_ID
+    env = make_env(args.env_id)
     raw_obs_dim, action_dim = get_dims(env)
-    obs_dim = feature_dim(task_name, raw_obs_dim)
+    obs_dim = feature_dim(raw_obs_dim)
     buffer = ReplayBuffer(obs_dim, action_dim, args.buffer_size)
-    collect_random_data(env, buffer, args.total_env_steps, args.seed, args, task_name)
+    collect_random_data(env, buffer, args.total_env_steps, args.seed, args)
 
     use_normalize = True
     if use_normalize:
@@ -230,6 +209,7 @@ def main() -> None:
 
     dataset = prepare_dataset(args)  #准备buffer并且填充buffer
     model = build_model(args, dataset.obs_dim, dataset.action_dim, device)
+    print_model_size(model, dataset.obs_dim, dataset.action_dim)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
     run_dir = build_run_dir(args.run_dir, args.env_id)
     train_model(
