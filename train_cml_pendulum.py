@@ -11,6 +11,7 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 import random
+import re
 from types import SimpleNamespace
 
 import numpy as np
@@ -39,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--buffer-size", type=int, default=300_000)
     parser.add_argument("--random-pendulum-theta-range", type=float, default=np.pi)
     parser.add_argument("--random-pendulum-ang-vel-range", type=float, default=8.0)
-    parser.add_argument("--updates", type=int, default=50_000)
+    parser.add_argument("--updates", type=int, default=100_000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--recon-weight", type=float, default=0.1)
@@ -47,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-every", type=int, default=5000)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--run-dir", type=str, default="runs")
+    parser.add_argument("--load-run", type=str, default=None, help="checkpoint .pt path or run directory to continue from")
     return parser.parse_args()
 
 
@@ -121,6 +123,62 @@ def print_model_size(model: NeuralCML, obs_dim: int, action_dim: int) -> None:
     )
 
 
+def resolve_load_checkpoint(load_run: str | None) -> Path | None:
+    """Resolve --load-run as either a checkpoint file or a run directory."""
+    if load_run is None:
+        return None
+
+    path = Path(load_run)
+    if path.is_file():
+        return path
+    if path.is_dir():
+        checkpoints = sorted(path.rglob("model_*.pt"), key=lambda item: item.stat().st_mtime, reverse=True)
+        if not checkpoints:
+            raise FileNotFoundError(f"No model_*.pt checkpoint found in {path}")
+        return checkpoints[0]
+    raise FileNotFoundError(f"--load-run does not exist: {path}")
+
+
+def checkpoint_update_index(checkpoint_path: Path | None) -> int:
+    """Infer the checkpoint step from names like model_50000.pt."""
+    if checkpoint_path is None:
+        return 0
+    match = re.search(r"model_(\d+)\.pt$", checkpoint_path.name)
+    if match is None:
+        return 0
+    return int(match.group(1))
+
+
+def load_checkpoint_stats(checkpoint_path: Path | None) -> tuple[np.ndarray, np.ndarray] | None:
+    """Load observation normalization stats before collecting a continuation dataset."""
+    if checkpoint_path is None:
+        return None
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    return (
+        np.asarray(ckpt["obs_mean"], dtype=np.float32),
+        np.asarray(ckpt["obs_std"], dtype=np.float32),
+    )
+
+
+def load_model_checkpoint(
+    checkpoint_path: Path | None,
+    model: NeuralCML,
+    optimizer: optim.Optimizer,
+    device: torch.device,
+) -> int:
+    """Restore model and optimizer state, returning the checkpoint update index."""
+    if checkpoint_path is None:
+        return 0
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    optimizer_state = ckpt.get("optimizer_state_dict")
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
+    start_update = checkpoint_update_index(checkpoint_path)
+    print(f"Loaded checkpoint: {checkpoint_path} (start_update={start_update})")
+    return start_update
+
+
 def train_model(
     model: NeuralCML,
     buffer: ReplayBuffer,
@@ -130,11 +188,12 @@ def train_model(
     run_dir: Path,
     obs_mean: np.ndarray,
     obs_std: np.ndarray,
+    start_update: int = 0,
 ) -> None:
     """执行完整的自监督训练循环。"""
     pbar = trange(args.updates, desc="Training CML")  #带进度条的循环
-    for step in pbar:
-        update_idx = step + 1
+    for local_step in pbar:
+        update_idx = start_update + local_step + 1
         batch = buffer.sample(args.batch_size, device)  #从回放池里随机采样一个 batch
         loss_out = model.loss(
             batch.obs,
@@ -155,7 +214,7 @@ def train_model(
                 recon=f"{loss_out.recon.item():.4f}",
             )
 
-        if update_idx % args.save_every == 0 or update_idx == args.updates:
+        if update_idx % args.save_every == 0 or local_step + 1 == args.updates:
             save_checkpoint(
                 run_dir / f"model_{update_idx}.pt",
                 model,
@@ -166,7 +225,7 @@ def train_model(
             )
 
 
-def prepare_dataset(args: argparse.Namespace):
+def prepare_dataset(args: argparse.Namespace, loaded_stats: tuple[np.ndarray, np.ndarray] | None = None):
     """创建环境、采样数据并完成标准化。"""
     args.env_id = ENV_ID
     env = make_env(args.env_id)
@@ -175,15 +234,20 @@ def prepare_dataset(args: argparse.Namespace):
     buffer = ReplayBuffer(obs_dim, action_dim, args.buffer_size)
     collect_random_data(env, buffer, args.total_env_steps, args.seed, args)
 
-    use_normalize = True
-    if use_normalize:
+    if loaded_stats is not None:
+        obs_mean_np, obs_std_np = loaded_stats
+        if obs_mean_np.shape[0] != obs_dim or obs_std_np.shape[0] != obs_dim:
+            raise ValueError(f"Loaded checkpoint stats do not match obs_dim={obs_dim}.")
+        obs_mean_t = torch.as_tensor(obs_mean_np, dtype=torch.float32)
+        obs_std_t = torch.as_tensor(obs_std_np, dtype=torch.float32)
+        print(f"Loaded observation mean: {obs_mean_t}")
+        print(f"Loaded observation std: {obs_std_t}")
+        normalize_replay_buffer(buffer, obs_mean_t, obs_std_t)
+    else:
         obs_mean_t, obs_std_t = compute_obs_stats(buffer.obs[: buffer.size])
         print(f"Observation mean: {obs_mean_t}")
         print(f"Observation std: {obs_std_t}")
         normalize_replay_buffer(buffer, obs_mean_t, obs_std_t)
-    else:
-        obs_mean_t = torch.zeros(obs_dim, dtype=torch.float32)
-        obs_std_t = torch.ones(obs_dim, dtype=torch.float32)
 
     return SimpleNamespace(
         env=env,
@@ -206,12 +270,15 @@ def main() -> None:
     args = parse_args()
     set_seed(args.seed)
     device = resolve_device(args.device)
+    checkpoint_path = resolve_load_checkpoint(args.load_run)
+    loaded_stats = load_checkpoint_stats(checkpoint_path)
 
-    dataset = prepare_dataset(args)  #准备buffer并且填充buffer
+    dataset = prepare_dataset(args, loaded_stats=loaded_stats)  #准备buffer并且填充buffer
     model = build_model(args, dataset.obs_dim, dataset.action_dim, device)
     print_model_size(model, dataset.obs_dim, dataset.action_dim)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
-    run_dir = build_run_dir(args.run_dir, args.env_id)
+    start_update = load_model_checkpoint(checkpoint_path, model, optimizer, device)
+    run_dir = checkpoint_path.parent if checkpoint_path is not None else build_run_dir(args.run_dir, args.env_id)
     train_model(
         model,
         dataset.buffer,
@@ -221,6 +288,7 @@ def main() -> None:
         run_dir,
         dataset.obs_mean,
         dataset.obs_std,
+        start_update=start_update,
     )
     print(f"Saved checkpoints to {run_dir}")
     dataset.env.close()

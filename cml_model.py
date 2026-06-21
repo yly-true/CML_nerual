@@ -15,14 +15,13 @@ CML_HIDDEN_DIMS = [64, 64]
 
 
 def mlp(input_dim: int, hidden_dims: Sequence[int], output_dim: int) -> nn.Sequential:
-    """构建带 LayerNorm 的 MLP，用于稳定 latent 预测。"""
+    """构建硬件友好的 ReLU MLP。"""
     layers = []
     last_dim = input_dim
     for hidden_dim in hidden_dims:
         layers += [
             nn.Linear(last_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
+            nn.ReLU(),
         ]
         last_dim = hidden_dim
     layers.append(nn.Linear(last_dim, output_dim))

@@ -22,8 +22,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--max-steps", type=int, default=200)
-    parser.add_argument("--num-sequences", type=int, default=2048 * 4)
-    parser.add_argument("--horizon", type=int, default=5)
+    parser.add_argument("--num-sequences", type=int, default=2048)
+    parser.add_argument("--horizon", type=int, default=1)
     parser.add_argument("--action-cost", type=float, default=0)
     parser.add_argument("--action-sampling", type=str, choices=("uniform", "gaussian"), default="gaussian")
     parser.add_argument(

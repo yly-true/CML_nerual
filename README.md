@@ -35,16 +35,25 @@ python -m pip install -r requirements.txt
 python train_cml_pendulum.py --device cuda
 ```
 
-默认训练 300000 步数据、50000 次更新，checkpoint 保存到：
+默认训练 300000 步数据、100000 次更新，checkpoint 保存到：
 
 ```text
 runs\Pendulum_v1\<timestamp>\model_<updates>.pt
 ```
 
+从已有 checkpoint 继续训练：
+
+```powershell
+python train_cml_pendulum.py --device cuda --load-run runs\Pendulum_v1
+```
+
+`--load-run` 可以传 `.pt` 文件，也可以传 run 目录；传目录时会自动选择最新的 `model_*.pt`。
+续训时 `--updates` 表示在已有 checkpoint 后继续训练的更新次数。
+
 ## 评估
 
 ```powershell
-$ckpt = Get-ChildItem runs\Pendulum_v1 -Recurse -Filter model_50000.pt | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+$ckpt = Get-ChildItem runs\Pendulum_v1 -Recurse -Filter model_100000.pt | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
 python evaluate.py --checkpoint "$ckpt" --episodes 3 --device cuda --render
 ```
 
@@ -72,3 +81,4 @@ CML_HIDDEN_DIMS = [64, 64]
 ```
 
 `CML_HIDDEN_DIMS` 中每个数字对应一层隐藏层宽度。
+每个隐藏层使用硬件友好的 `Linear -> ReLU`，没有 LayerNorm。
