@@ -19,10 +19,10 @@ import torch
 from torch import optim
 from tqdm import trange
 
-from cml_model import NeuralCML
-from replay_buffer import ReplayBuffer
-from tasks import feature_dim, obs_to_features, reset_train_env, resolve_env_id, resolve_task_name
-from utils import (
+from cml.cml_model import NeuralCML
+from cml.replay_buffer import ReplayBuffer
+from cml.tasks import feature_dim, obs_to_features, reset_train_env, resolve_env_id, resolve_task_name
+from cml.utils import (
     get_dims,
     make_env,
     resolve_device,

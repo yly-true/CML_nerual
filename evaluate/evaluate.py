@@ -11,9 +11,9 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from cml_model import CML_HIDDEN_DIMS, CML_LATENT_DIM, NeuralCML, plan_action_cem, plan_action_random_shooting
-from tasks import feature_dim, feature_names, format_obs, obs_to_features, reset_eval_env, resolve_env_id, resolve_task_name, target_features
-from utils import get_dims, make_env, resolve_device
+from cml.cml_model import CML_HIDDEN_DIMS, CML_LATENT_DIM, NeuralCML, plan_action_cem, plan_action_random_shooting
+from cml.tasks import feature_dim, feature_names, format_obs, obs_to_features, reset_eval_env, resolve_env_id, resolve_task_name, target_features
+from cml.utils import get_dims, make_env, resolve_device
 
 
 def parse_args() -> argparse.Namespace:

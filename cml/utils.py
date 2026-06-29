@@ -14,7 +14,7 @@ import torch
 def make_env(env_id: str, render_mode: str | None = None):
     """创建 Gymnasium 环境。"""
     if env_id == "ContinuousCartPole-v0":
-        from tasks import make_continuous_cartpole_env
+        from cml.tasks import make_continuous_cartpole_env
 
         return make_continuous_cartpole_env(render_mode=render_mode)
     make_kwargs = {}

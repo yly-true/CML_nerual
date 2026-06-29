@@ -1,8 +1,5 @@
-runs/
-logs/
 __pycache__/
 *.py[cod]
-*.zip
-*.pt
-*.pth
-*.ckpt
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

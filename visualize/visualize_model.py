@@ -10,9 +10,9 @@ from matplotlib.animation import FuncAnimation
 import numpy as np
 import torch
 
-from cml_model import CML_HIDDEN_DIMS, CML_LATENT_DIM, NeuralCML
-from tasks import CARTPOLE, PENDULUM, feature_dim, obs_to_features, resolve_env_id, resolve_task_name
-from utils import get_dims, make_env, resolve_device
+from cml.cml_model import CML_HIDDEN_DIMS, CML_LATENT_DIM, NeuralCML
+from cml.tasks import CARTPOLE, PENDULUM, feature_dim, obs_to_features, resolve_env_id, resolve_task_name
+from cml.utils import get_dims, make_env, resolve_device
 
 
 def parse_args() -> argparse.Namespace:
