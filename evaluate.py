@@ -1,4 +1,4 @@
-"""评估训练好的 Neural CML 在 Pendulum-v1 上的表现。"""
+"""评估训练好的 Neural CML。"""
 
 from __future__ import annotations
 
@@ -12,14 +12,15 @@ import numpy as np
 import torch
 
 from cml_model import CML_HIDDEN_DIMS, CML_LATENT_DIM, NeuralCML, plan_action_random_shooting
-from tasks import ENV_ID, feature_dim, feature_names, format_obs, obs_to_features, reset_eval_env, target_features
+from tasks import feature_dim, feature_names, format_obs, obs_to_features, reset_eval_env, resolve_env_id, resolve_task_name, target_features
 from utils import get_dims, make_env, normalize_obs, resolve_device
 
 
 def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
-    parser = argparse.ArgumentParser(description="评估 Pendulum-v1 上的 Neural CML")
+    parser = argparse.ArgumentParser(description="评估连续控制任务上的 Neural CML")
     parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--task", choices=("pendulum", "cartpole"), default="pendulum")
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--num-sequences", type=int, default=2048)
@@ -34,6 +35,7 @@ def parse_args() -> argparse.Namespace:
         help="Gaussian action sampling std. Provide one value or one per action dimension. Defaults to action range / 4.",
     )
     parser.add_argument("--target-angular-velocity", type=float, default=0.0)
+    parser.add_argument("--target-cart-position", type=float, default=0.0)
     parser.add_argument(
         "--inference-mode",
         type=str,
@@ -46,7 +48,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         nargs="*",
         default=None,
-        help="Optional feature weights in Pendulum feature order: cos(theta), sin(theta), thetadot.",
+        help="Optional feature weights in the selected task's feature order.",
     )
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--render", action="store_true")
@@ -132,7 +134,7 @@ def prepare_planner_inputs(
     obs_weights_t = None
     if args.obs_cost_weights is not None:
         if len(args.obs_cost_weights) != obs_dim:
-            raise ValueError(f"--obs-cost-weights must contain {obs_dim} values for Pendulum-v1.")
+            raise ValueError(f"--obs-cost-weights must contain {obs_dim} values for this task.")
         obs_weights_t = torch.as_tensor(args.obs_cost_weights, dtype=torch.float32, device=device)
     action_std_t = None
     if args.action_std is not None:
@@ -229,10 +231,10 @@ class TerminalKeyListener:
         return any(key == self.reset_key for key in self._read_available_keys())
 
 
-def reset_env_to_initial_state(env, args: argparse.Namespace) -> np.ndarray:
+def reset_env_to_initial_state(task_name: str, env, args: argparse.Namespace) -> np.ndarray:
     """Reset environment and render/log the initial state."""
-    obs = reset_eval_env(env)
-    print(format_obs("reset_obs", obs))
+    obs = reset_eval_env(task_name, env)
+    print(format_obs(task_name, "reset_obs", obs))
     maybe_render(env, args)
     return obs
 
@@ -241,14 +243,15 @@ def run_episode(
     env,
     model: NeuralCML,
     planner_inputs,
+    task_name: str,
     obs_mean,
     obs_std,
     args: argparse.Namespace,
     device: torch.device,
 ) -> tuple[float, int]:
     """执行一条评估 episode。"""
-    obs = reset_env_to_initial_state(env, args)
-    print(format_obs("initial_obs", obs))
+    obs = reset_env_to_initial_state(task_name, env, args)
+    print(format_obs(task_name, "initial_obs", obs))
     ep_return = 0.0
     ep_len = 0
     objective = objective_from_inference_mode(args.inference_mode)
@@ -256,14 +259,14 @@ def run_episode(
     with TerminalKeyListener(args.reset_key) as key_listener:
         for _ in range(args.max_steps):
             if key_listener.reset_requested():
-                obs = reset_env_to_initial_state(env, args)
+                obs = reset_env_to_initial_state(task_name, env, args)
                 continue
 
-            obs_features = obs_to_features(obs)
+            obs_features = obs_to_features(task_name, obs)
             norm_obs = normalize_obs(obs_features.astype(np.float32), obs_mean, obs_std)
             obs_t = torch.as_tensor(norm_obs, dtype=torch.float32, device=device)
 
-            goal_features = target_features(args)
+            goal_features = target_features(task_name, args)
             norm_goal = normalize_obs(goal_features, obs_mean, obs_std)
             goal_t = torch.as_tensor(norm_goal, dtype=torch.float32, device=device)
 
@@ -289,8 +292,8 @@ def run_episode(
             ep_return += float(reward)
             ep_len += 1
             if args.log_every > 0 and ep_len % args.log_every == 0:
-                target = target_features(args)
-                print(f"{format_obs('obs', obs)}, target={target}")
+                target = target_features(task_name, args)
+                print(f"{format_obs(task_name, 'obs', obs)}, target={target}")
 
             if args.render_every > 0 and ep_len % args.render_every == 0:
                 maybe_render(env, args)
@@ -303,29 +306,31 @@ def run_episode(
 
 def main() -> None:
     args = parse_args()
+    task_name = resolve_task_name(args.task)
+    env_id = resolve_env_id(task_name)
     device = resolve_device(args.device)
     render_mode = "human" if args.render else None
-    env = make_env(ENV_ID, render_mode=render_mode)
+    env = make_env(env_id, render_mode=render_mode)
     raw_obs_dim, action_dim = get_dims(env)
-    expected_obs_dim = feature_dim(raw_obs_dim)
+    expected_obs_dim = feature_dim(task_name, raw_obs_dim)
     model, obs_mean, obs_std = load_model_and_stats(args, action_dim, device)
     obs_dim = int(np.asarray(obs_mean).shape[0])
     if obs_dim != expected_obs_dim:
         raise ValueError(
-            f"Checkpoint obs_dim={obs_dim} does not match Pendulum-v1 feature_dim={expected_obs_dim}. "
-            "Train a Pendulum-v1 checkpoint."
+            f"Checkpoint obs_dim={obs_dim} does not match task={task_name} feature_dim={expected_obs_dim}. "
+            "Train a checkpoint for the selected task."
         )
     planner_inputs = prepare_planner_inputs(env, obs_dim, obs_mean, obs_std, device, args)
 
     print(
         "inference: "
-        f"env_id={ENV_ID}, mode={args.inference_mode}, planner=random, "
+        f"task={task_name}, env_id={env_id}, mode={args.inference_mode}, planner=random, "
         f"objective={objective_from_inference_mode(args.inference_mode)}, "
-        f"features={feature_names()}, action_cost={args.action_cost}, "
+        f"features={feature_names(task_name)}, action_cost={args.action_cost}, "
         f"action_sampling={args.action_sampling}, action_std={args.action_std}, "
         f"num_sequences={args.num_sequences}, horizon={args.horizon}"
     )
-    print(f"target pendulum: cos(theta)=1.0, sin(theta)=0.0, thetadot={args.target_angular_velocity}")
+    print(f"target: {target_features(task_name, args)}")
     if args.render:
         print(
             f"render: render_every={args.render_every}, render_sleep={args.render_sleep}, "
@@ -339,6 +344,7 @@ def main() -> None:
             env=env,
             model=model,
             planner_inputs=planner_inputs,
+            task_name=task_name,
             obs_mean=obs_mean,
             obs_std=obs_std,
             args=args,

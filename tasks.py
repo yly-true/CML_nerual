@@ -1,41 +1,81 @@
-"""Pendulum-v1 task helpers."""
+"""Task helpers for supported continuous-control systems."""
 
 from __future__ import annotations
 
 import argparse
 import math
 
+import gymnasium as gym
 import numpy as np
+from gymnasium import spaces
 
 
-TASK_NAME = "pendulum"
-ENV_ID = "Pendulum-v1"
+PENDULUM = "pendulum"
+CARTPOLE = "cartpole"
+
+TASK_ENV_IDS = {
+    PENDULUM: "Pendulum-v1",
+    CARTPOLE: "ContinuousCartPole-v0",
+}
 
 
-def feature_names() -> list[str]:
-    """Return feature names in model observation order."""
-    return ["cos(theta)", "sin(theta)", "thetadot"]
+def resolve_task_name(task: str) -> str:
+    if task not in TASK_ENV_IDS:
+        raise ValueError(f"Unsupported task: {task}")
+    return task
 
 
-def feature_dim(raw_obs_dim: int) -> int:
-    """Return model feature dimension and validate raw observation shape."""
-    expected_raw_dim = 3
+def resolve_env_id(task_name: str) -> str:
+    return TASK_ENV_IDS[task_name]
+
+
+def feature_names(task_name: str) -> list[str]:
+    if task_name == PENDULUM:
+        return ["cos(theta)", "sin(theta)", "thetadot"]
+    if task_name == CARTPOLE:
+        return ["x", "sin(theta)", "cos(theta)", "xdot", "thetadot"]
+    raise ValueError(f"Unsupported task: {task_name}")
+
+
+def feature_dim(task_name: str, raw_obs_dim: int) -> int:
+    expected_raw_dim = 3 if task_name == PENDULUM else 4
     if raw_obs_dim < expected_raw_dim:
-        raise ValueError(f"Pendulum-v1 expects raw obs dim >= {expected_raw_dim}, got {raw_obs_dim}.")
-    return expected_raw_dim
+        raise ValueError(f"{task_name} expects raw obs dim >= {expected_raw_dim}, got {raw_obs_dim}.")
+    return 3 if task_name == PENDULUM else 5
 
 
-def obs_to_features(obs) -> np.ndarray:
-    """Pendulum-v1 already exposes [cos(theta), sin(theta), thetadot]."""
-    return np.asarray(obs, dtype=np.float32)
+def obs_to_features(task_name: str, obs) -> np.ndarray:
+    obs_arr = np.asarray(obs, dtype=np.float32)
+    if task_name == PENDULUM:
+        return obs_arr
+    if task_name == CARTPOLE:
+        features = np.zeros(obs_arr.shape[:-1] + (5,), dtype=np.float32)
+        features[..., 0] = obs_arr[..., 0]
+        features[..., 1] = np.sin(obs_arr[..., 1])
+        features[..., 2] = np.cos(obs_arr[..., 1])
+        features[..., 3] = obs_arr[..., 2]
+        features[..., 4] = obs_arr[..., 3]
+        return features
+    raise ValueError(f"Unsupported task: {task_name}")
 
 
-def target_features(args: argparse.Namespace) -> np.ndarray:
-    """Build the upright pendulum target in feature space."""
-    return np.asarray([1.0, 0.0, args.target_angular_velocity], dtype=np.float32)
+def target_features(task_name: str, args: argparse.Namespace) -> np.ndarray:
+    if task_name == PENDULUM:
+        return np.asarray([1.0, 0.0, args.target_angular_velocity], dtype=np.float32)
+    if task_name == CARTPOLE:
+        return np.asarray([args.target_cart_position, 0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    raise ValueError(f"Unsupported task: {task_name}")
 
 
-def reset_train_env(env, args: argparse.Namespace, seed: int | None = None) -> np.ndarray:
+def reset_train_env(task_name: str, env, args: argparse.Namespace, seed: int | None = None) -> np.ndarray:
+    if task_name == PENDULUM:
+        return reset_pendulum_train(env, args, seed=seed)
+    if task_name == CARTPOLE:
+        return reset_cartpole_train(env, args, seed=seed)
+    raise ValueError(f"Unsupported task: {task_name}")
+
+
+def reset_pendulum_train(env, args: argparse.Namespace, seed: int | None = None) -> np.ndarray:
     """Reset Pendulum to a broad random angle/angular-velocity state."""
     if seed is None:
         env.reset()
@@ -51,34 +91,172 @@ def reset_train_env(env, args: argparse.Namespace, seed: int | None = None) -> n
     theta = np.random.uniform(-theta_range, theta_range)
     theta_dot = np.random.uniform(-angular_velocity_range, angular_velocity_range)
     sim.state = np.asarray([theta, theta_dot], dtype=np.float32)
-    return current_obs(env)
+    return current_obs(PENDULUM, env)
 
 
-def reset_eval_env(env) -> np.ndarray:
-    """Reset the Pendulum evaluation environment."""
+def reset_cartpole_train(env, args: argparse.Namespace, seed: int | None = None) -> np.ndarray:
+    """Reset the cart-pole to a broad random state."""
+    if seed is None:
+        env.reset()
+    else:
+        env.reset(seed=seed)
+
+    sim = env.unwrapped
+    cart_pos = np.random.uniform(-args.random_cart_pos_range, args.random_cart_pos_range)
+    pole_angle = np.random.uniform(-args.random_pole_angle_range, args.random_pole_angle_range)
+    cart_vel = np.random.uniform(-args.random_cart_vel_range, args.random_cart_vel_range)
+    pole_ang_vel = np.random.uniform(-args.random_pole_ang_vel_range, args.random_pole_ang_vel_range)
+    sim.state = np.asarray([cart_pos, pole_angle, cart_vel, pole_ang_vel], dtype=np.float32)
+    return current_obs(CARTPOLE, env)
+
+
+def reset_eval_env(task_name: str, env) -> np.ndarray:
     obs, _ = env.reset()
     return np.asarray(obs, dtype=np.float32)
 
 
-def current_obs(env) -> np.ndarray:
-    """Return the current Pendulum observation."""
+def current_obs(task_name: str, env) -> np.ndarray:
     sim = env.unwrapped
-    if hasattr(sim, "_get_obs"):
-        return np.asarray(sim._get_obs(), dtype=np.float32)
-    if hasattr(sim, "state"):
-        theta, theta_dot = np.asarray(sim.state, dtype=np.float32)
-        return np.asarray([np.cos(theta), np.sin(theta), theta_dot], dtype=np.float32)
+    if task_name == PENDULUM:
+        if hasattr(sim, "_get_obs"):
+            return np.asarray(sim._get_obs(), dtype=np.float32)
+        if hasattr(sim, "state"):
+            theta, theta_dot = np.asarray(sim.state, dtype=np.float32)
+            return np.asarray([np.cos(theta), np.sin(theta), theta_dot], dtype=np.float32)
+    if task_name == CARTPOLE and hasattr(sim, "state"):
+        return np.asarray(sim.state, dtype=np.float32)
     raise RuntimeError("Current environment does not expose current observation.")
 
 
-def format_obs(prefix: str, obs: np.ndarray) -> str:
-    """Format Pendulum observation values for logs."""
+def format_obs(task_name: str, prefix: str, obs: np.ndarray) -> str:
     obs_arr = np.asarray(obs, dtype=np.float32)
-    theta = math.atan2(float(obs_arr[1]), float(obs_arr[0]))
-    return (
-        f"{prefix}: "
-        f"cos(theta)={obs_arr[0]:.4f}, "
-        f"sin(theta)={obs_arr[1]:.4f}, "
-        f"theta={theta:.4f}, "
-        f"thetadot={obs_arr[2]:.4f}"
-    )
+    if task_name == PENDULUM:
+        theta = math.atan2(float(obs_arr[1]), float(obs_arr[0]))
+        return (
+            f"{prefix}: "
+            f"cos(theta)={obs_arr[0]:.4f}, "
+            f"sin(theta)={obs_arr[1]:.4f}, "
+            f"theta={theta:.4f}, "
+            f"thetadot={obs_arr[2]:.4f}"
+        )
+    if task_name == CARTPOLE:
+        return (
+            f"{prefix}: "
+            f"x={obs_arr[0]:.4f}, "
+            f"theta={obs_arr[1]:.4f}, "
+            f"xdot={obs_arr[2]:.4f}, "
+            f"thetadot={obs_arr[3]:.4f}"
+        )
+    raise ValueError(f"Unsupported task: {task_name}")
+
+
+class ContinuousCartPoleEnv(gym.Env):
+    """Classic single-link cart-pole with continuous horizontal force."""
+
+    metadata = {"render_modes": ["human"], "render_fps": 50}
+
+    def __init__(self, render_mode: str | None = None) -> None:
+        self.gravity = 9.8
+        self.masscart = 1.0
+        self.masspole = 0.1
+        self.total_mass = self.masscart + self.masspole
+        self.length = 0.5
+        self.polemass_length = self.masspole * self.length
+        self.force_mag = 10.0
+        self.tau = 0.02
+        self.x_threshold = 4.8
+        self.theta_threshold_radians = math.pi
+        self.max_episode_steps = 500
+        self.render_mode = render_mode
+        high = np.asarray(
+            [
+                self.x_threshold * 2,
+                np.finfo(np.float32).max,
+                np.finfo(np.float32).max,
+                np.finfo(np.float32).max,
+            ],
+            dtype=np.float32,
+        )
+        self.observation_space = spaces.Box(-high, high, dtype=np.float32)
+        self.action_space = spaces.Box(
+            low=np.asarray([-self.force_mag], dtype=np.float32),
+            high=np.asarray([self.force_mag], dtype=np.float32),
+            dtype=np.float32,
+        )
+        self.state = np.zeros(4, dtype=np.float32)
+        self.steps = 0
+        self._fig = None
+        self._ax = None
+
+    def reset(self, *, seed: int | None = None, options=None):
+        super().reset(seed=seed)
+        self.state = self.np_random.uniform(low=-0.05, high=0.05, size=(4,)).astype(np.float32)
+        self.steps = 0
+        return self.state.copy(), {}
+
+    def step(self, action):
+        force = float(np.clip(np.asarray(action, dtype=np.float32)[0], -self.force_mag, self.force_mag))
+        x, theta, x_dot, theta_dot = [float(v) for v in self.state]
+        costheta = math.cos(theta)
+        sintheta = math.sin(theta)
+
+        temp = (force + self.polemass_length * theta_dot**2 * sintheta) / self.total_mass
+        thetaacc = (self.gravity * sintheta - costheta * temp) / (
+            self.length * (4.0 / 3.0 - self.masspole * costheta**2 / self.total_mass)
+        )
+        xacc = temp - self.polemass_length * thetaacc * costheta / self.total_mass
+
+        x = x + self.tau * x_dot
+        x_dot = x_dot + self.tau * xacc
+        theta = angle_normalize(theta + self.tau * theta_dot)
+        theta_dot = theta_dot + self.tau * thetaacc
+
+        self.state = np.asarray([x, theta, x_dot, theta_dot], dtype=np.float32)
+        self.steps += 1
+        terminated = bool(abs(x) > self.x_threshold or abs(theta) > self.theta_threshold_radians)
+        truncated = self.steps >= self.max_episode_steps
+        reward = float(-(x**2 + 10.0 * angle_normalize(theta) ** 2 + 0.1 * x_dot**2 + 0.1 * theta_dot**2 + 0.001 * force**2))
+        if self.render_mode == "human":
+            self.render()
+        return self.state.copy(), reward, terminated, truncated, {}
+
+    def render(self):
+        if self.render_mode != "human":
+            return None
+        import matplotlib.pyplot as plt
+
+        if self._fig is None:
+            plt.ion()
+            self._fig, self._ax = plt.subplots(figsize=(6, 3))
+        assert self._ax is not None
+        x, theta, _, _ = self.state
+        pole_x = x + math.sin(theta)
+        pole_y = math.cos(theta)
+        self._ax.clear()
+        self._ax.set_xlim(-self.x_threshold, self.x_threshold)
+        self._ax.set_ylim(-1.2, 1.2)
+        self._ax.set_aspect("equal")
+        self._ax.grid(True, alpha=0.25)
+        self._ax.plot([-self.x_threshold, self.x_threshold], [0, 0], color="black", lw=1)
+        self._ax.add_patch(plt.Rectangle((x - 0.2, -0.1), 0.4, 0.2, fill=False, lw=2))
+        self._ax.plot([x, pole_x], [0, pole_y], lw=3)
+        self._ax.plot([pole_x], [pole_y], marker="o")
+        self._fig.canvas.draw()
+        self._fig.canvas.flush_events()
+        return None
+
+    def close(self):
+        if self._fig is not None:
+            import matplotlib.pyplot as plt
+
+            plt.close(self._fig)
+            self._fig = None
+            self._ax = None
+
+
+def angle_normalize(angle: float) -> float:
+    return ((angle + math.pi) % (2.0 * math.pi)) - math.pi
+
+
+def make_continuous_cartpole_env(render_mode: str | None = None):
+    return ContinuousCartPoleEnv(render_mode=render_mode)

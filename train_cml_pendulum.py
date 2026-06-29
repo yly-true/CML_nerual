@@ -21,7 +21,7 @@ from tqdm import trange
 
 from cml_model import NeuralCML
 from replay_buffer import ReplayBuffer
-from tasks import ENV_ID, feature_dim, obs_to_features, reset_train_env
+from tasks import feature_dim, obs_to_features, reset_train_env, resolve_env_id, resolve_task_name
 from utils import (
     compute_obs_stats,
     get_dims,
@@ -34,12 +34,17 @@ from utils import (
 
 def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
-    parser = argparse.ArgumentParser(description="训练 Pendulum-v1 上的 Neural CML")
+    parser = argparse.ArgumentParser(description="训练连续控制任务上的 Neural CML")
+    parser.add_argument("--task", choices=("pendulum", "cartpole"), default="pendulum")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--total-env-steps", type=int, default=300_000)
     parser.add_argument("--buffer-size", type=int, default=300_000)
     parser.add_argument("--random-pendulum-theta-range", type=float, default=np.pi)
     parser.add_argument("--random-pendulum-ang-vel-range", type=float, default=8.0)
+    parser.add_argument("--random-cart-pos-range", type=float, default=2.4)
+    parser.add_argument("--random-pole-angle-range", type=float, default=np.pi)
+    parser.add_argument("--random-cart-vel-range", type=float, default=4.0)
+    parser.add_argument("--random-pole-ang-vel-range", type=float, default=8.0)
     parser.add_argument("--updates", type=int, default=100_000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -74,7 +79,7 @@ def collect_random_data(
     gaussian_std = np.maximum((action_high - action_low) / 8.0, 1e-6)
     gaussian_prob = 0.5
 
-    obs = reset_train_env(env, args, seed=seed)
+    obs = reset_train_env(args.task, env, args, seed=seed)
     for _ in trange(steps, desc="Collecting random transitions"):
         if np.random.rand() < gaussian_prob:
             action = np.random.normal(loc=gaussian_mean, scale=gaussian_std).astype(np.float32)
@@ -84,14 +89,14 @@ def collect_random_data(
         next_obs, _, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
         buffer.add(
-            obs_to_features(obs),
+            obs_to_features(args.task, obs),
             action,
-            obs_to_features(next_obs),
+            obs_to_features(args.task, next_obs),
             done,
         )
         obs = next_obs
         if done:
-            obs = reset_train_env(env, args)
+            obs = reset_train_env(args.task, env, args)
 
 
 def build_model(args: argparse.Namespace, obs_dim: int, action_dim: int, device: torch.device) -> NeuralCML:
@@ -227,10 +232,11 @@ def train_model(
 
 def prepare_dataset(args: argparse.Namespace, loaded_stats: tuple[np.ndarray, np.ndarray] | None = None):
     """创建环境、采样数据并完成标准化。"""
-    args.env_id = ENV_ID
+    args.task = resolve_task_name(args.task)
+    args.env_id = resolve_env_id(args.task)
     env = make_env(args.env_id)
     raw_obs_dim, action_dim = get_dims(env)
-    obs_dim = feature_dim(raw_obs_dim)
+    obs_dim = feature_dim(args.task, raw_obs_dim)
     buffer = ReplayBuffer(obs_dim, action_dim, args.buffer_size)
     collect_random_data(env, buffer, args.total_env_steps, args.seed, args)
 

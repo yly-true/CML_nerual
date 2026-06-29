@@ -1,6 +1,6 @@
-# Pendulum CML 虚拟仿真器
+# CML 虚拟仿真器
 
-这是一个只针对 Gymnasium `Pendulum-v1` 的 Neural CML 实验项目。模型学习一步动力学：
+这是一个 Neural CML 实验项目。模型学习一步动力学：
 
 ```text
 当前观测 + 动作 -> 下一观测
@@ -15,10 +15,11 @@ s_next = s + delta
 obs_next = decoder(s_next)
 ```
 
-Pendulum 观测为：
+支持任务：
 
 ```text
-[cos(theta), sin(theta), thetadot]
+pendulum: Pendulum-v1
+cartpole: 连续力输入的经典小车-单杆倒立摆
 ```
 
 ## 安装
@@ -32,7 +33,8 @@ python -m pip install -r requirements.txt
 ## 训练
 
 ```powershell
-python train_cml_pendulum.py --device cuda
+python train_cml_pendulum.py --task pendulum --device cuda
+python train_cml_pendulum.py --task cartpole --device cuda
 ```
 
 默认训练 300000 步数据、100000 次更新，checkpoint 保存到：
@@ -44,7 +46,7 @@ runs\Pendulum_v1\<timestamp>\model_<updates>.pt
 从已有 checkpoint 继续训练：
 
 ```powershell
-python train_cml_pendulum.py --device cuda --load-run runs\Pendulum_v1
+python train_cml_pendulum.py --task cartpole --device cuda --load-run runs\ContinuousCartPole_v0
 ```
 
 `--load-run` 可以传 `.pt` 文件，也可以传 run 目录；传目录时会自动选择最新的 `model_*.pt`。
@@ -54,7 +56,10 @@ python train_cml_pendulum.py --device cuda --load-run runs\Pendulum_v1
 
 ```powershell
 $ckpt = Get-ChildItem runs\Pendulum_v1 -Recurse -Filter model_100000.pt | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
-python evaluate.py --checkpoint "$ckpt" --episodes 3 --device cuda --render
+python evaluate.py --task pendulum --checkpoint "$ckpt" --episodes 3 --device cuda --render
+
+$ckpt = Get-ChildItem runs\ContinuousCartPole_v0 -Recurse -Filter model_100000.pt | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+python evaluate.py --task cartpole --checkpoint "$ckpt" --episodes 3 --device cuda --render
 ```
 
 ## 可视化
@@ -62,7 +67,8 @@ python evaluate.py --checkpoint "$ckpt" --episodes 3 --device cuda --render
 查看最新 checkpoint 的真实环境和模型预测对比：
 
 ```powershell
-python visualize_model.py --show
+python visualize_model.py --task pendulum --show
+python visualize_model.py --task cartpole --show
 ```
 
 保存 GIF：

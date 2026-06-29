@@ -1,4 +1,4 @@
-"""Visualize a learned Pendulum-v1 dynamics model as a virtual simulator."""
+"""Visualize a learned dynamics model as a virtual simulator."""
 
 from __future__ import annotations
 
@@ -11,13 +11,14 @@ import numpy as np
 import torch
 
 from cml_model import CML_HIDDEN_DIMS, CML_LATENT_DIM, NeuralCML
-from tasks import ENV_ID
+from tasks import CARTPOLE, obs_to_features, resolve_env_id, resolve_task_name
 from utils import get_dims, make_env, normalize_obs, resolve_device
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="可视化 Pendulum-v1 Neural CML 虚拟仿真器")
     parser.add_argument("--checkpoint", type=str, default=None, help="默认自动使用 runs 里的最新 checkpoint。")
+    parser.add_argument("--task", choices=("pendulum", "cartpole"), default="pendulum")
     parser.add_argument("--steps", type=int, default=80)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cpu")
@@ -31,18 +32,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_checkpoint(checkpoint: str | None) -> str:
-    """Use the provided checkpoint or the newest saved Pendulum model."""
+def resolve_checkpoint(task_name: str, checkpoint: str | None) -> str:
+    """Use the provided checkpoint or the newest saved model for a task."""
     if checkpoint is not None:
         return checkpoint
 
+    env_id = resolve_env_id(task_name)
+    run_name = env_id.replace("/", "_").replace("-", "_")
     candidates = sorted(
-        Path("runs").glob("Pendulum_v1/*/model_*.pt"),
+        Path("runs").glob(f"{run_name}/*/model_*.pt"),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
     if not candidates:
-        raise FileNotFoundError("No checkpoint found under runs/Pendulum_v1. Train a model first.")
+        raise FileNotFoundError(f"No checkpoint found under runs/{run_name}. Train a model first.")
     return str(candidates[0])
 
 
@@ -113,20 +116,21 @@ def predict_next_obs(
 
 
 def rollout(args: argparse.Namespace, model: NeuralCML, obs_mean: np.ndarray, obs_std: np.ndarray, device: torch.device):
-    env = make_env(ENV_ID)
+    task_name = resolve_task_name(args.task)
+    env = make_env(resolve_env_id(task_name))
     _, action_dim = get_dims(env)
     actions = generate_actions(args, env)
 
     real_obs, _ = env.reset(seed=args.seed)
-    model_obs = np.asarray(real_obs, dtype=np.float32).copy()
-
-    real_traj = [np.asarray(real_obs, dtype=np.float32)]
-    model_traj = [model_obs.copy()]
+    real_obs = np.asarray(real_obs, dtype=np.float32)
+    model_features = obs_to_features(task_name, real_obs)
+    real_traj = [real_obs]
+    model_traj = [model_features.copy()]
     for action in actions:
         real_obs, _, terminated, truncated, _ = env.step(action)
-        model_obs = predict_next_obs(model, model_obs, action, obs_mean, obs_std, device)
+        model_features = predict_next_obs(model, model_features, action, obs_mean, obs_std, device)
         real_traj.append(np.asarray(real_obs, dtype=np.float32))
-        model_traj.append(model_obs.copy())
+        model_traj.append(model_features.copy())
         if terminated or truncated:
             break
 
@@ -135,21 +139,25 @@ def rollout(args: argparse.Namespace, model: NeuralCML, obs_mean: np.ndarray, ob
     return np.asarray(real_traj), np.asarray(model_traj), actions[:used_steps], action_dim
 
 
-def theta(obs: np.ndarray) -> np.ndarray:
+def theta(task_name: str, obs: np.ndarray) -> np.ndarray:
+    if task_name == CARTPOLE:
+        return np.arctan2(obs[..., 1], obs[..., 2])
     return np.arctan2(obs[..., 1], obs[..., 0])
 
 
-def rod_xy(obs: np.ndarray) -> tuple[float, float]:
-    angle = float(theta(obs))
+def rod_xy(task_name: str, obs: np.ndarray) -> tuple[float, float]:
+    angle = float(theta(task_name, obs))
     return float(np.sin(angle)), float(np.cos(angle))
 
 
 def make_animation(real_traj: np.ndarray, model_traj: np.ndarray, actions: np.ndarray, args: argparse.Namespace) -> FuncAnimation:
+    task_name = resolve_task_name(args.task)
     frames = len(real_traj)
-    real_theta = theta(real_traj)
-    model_theta = theta(model_traj)
-    real_thetadot = real_traj[:, 2]
-    model_thetadot = model_traj[:, 2]
+    real_features = obs_to_features(task_name, real_traj)
+    real_theta = theta(task_name, real_features)
+    model_theta = theta(task_name, model_traj)
+    real_thetadot = real_features[:, -1]
+    model_thetadot = model_traj[:, -1]
     t = np.arange(frames)
 
     fig = plt.figure(figsize=(11, 5))
@@ -158,8 +166,8 @@ def make_animation(real_traj: np.ndarray, model_traj: np.ndarray, actions: np.nd
     ax_angle = fig.add_subplot(gs[0, 1])
     ax_vel = fig.add_subplot(gs[1, 1])
 
-    ax_pendulum.set_title("Pendulum rollout: real vs model")
-    ax_pendulum.set_xlim(-1.25, 1.25)
+    ax_pendulum.set_title(f"{task_name} rollout: real vs model")
+    ax_pendulum.set_xlim(-4.8, 4.8) if task_name == CARTPOLE else ax_pendulum.set_xlim(-1.25, 1.25)
     ax_pendulum.set_ylim(-1.25, 1.25)
     ax_pendulum.set_aspect("equal")
     ax_pendulum.grid(True, alpha=0.25)
@@ -198,15 +206,17 @@ def make_animation(real_traj: np.ndarray, model_traj: np.ndarray, actions: np.nd
     fig.tight_layout()
 
     def update(frame: int):
-        rx, ry = rod_xy(real_traj[frame])
-        mx, my = rod_xy(model_traj[frame])
-        real_line.set_data([0, rx], [0, ry])
-        model_line.set_data([0, mx], [0, my])
-        real_bob.set_data([rx], [ry])
-        model_bob.set_data([mx], [my])
+        rx, ry = rod_xy(task_name, real_features[frame])
+        mx, my = rod_xy(task_name, model_traj[frame])
+        real_base_x = float(real_features[frame, 0]) if task_name == CARTPOLE else 0.0
+        model_base_x = float(model_traj[frame, 0]) if task_name == CARTPOLE else 0.0
+        real_line.set_data([real_base_x, real_base_x + rx], [0, ry])
+        model_line.set_data([model_base_x, model_base_x + mx], [0, my])
+        real_bob.set_data([real_base_x + rx], [ry])
+        model_bob.set_data([model_base_x + mx], [my])
         angle_cursor.set_xdata([frame, frame])
         vel_cursor.set_xdata([frame, frame])
-        error = float(np.linalg.norm(real_traj[frame] - model_traj[frame]))
+        error = float(np.linalg.norm(real_features[frame] - model_traj[frame]))
         time_text.set_text(f"step={frame}\nobs_error={error:.3f}")
         return real_line, model_line, real_bob, model_bob, angle_cursor, vel_cursor, time_text
 
@@ -227,10 +237,11 @@ def save_animation(anim: FuncAnimation, output: str, fps: int) -> None:
 
 def main() -> None:
     args = parse_args()
-    checkpoint = resolve_checkpoint(args.checkpoint)
+    args.task = resolve_task_name(args.task)
+    checkpoint = resolve_checkpoint(args.task, args.checkpoint)
     print(f"Using checkpoint: {checkpoint}")
     device = resolve_device(args.device)
-    env = make_env(ENV_ID)
+    env = make_env(resolve_env_id(args.task))
     _, action_dim = get_dims(env)
     env.close()
 
