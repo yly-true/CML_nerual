@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
         "--inference-mode",
         type=str,
         choices=("obsend", "obstraj", "latentend", "latenttraj"),
-        default="latentend",
+        default="obsend",
                         help="MPC objective: obsend, obstraj, latentend, or latenttraj.",
     )
     parser.add_argument(
