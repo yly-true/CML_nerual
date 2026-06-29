@@ -23,35 +23,33 @@ from cml_model import NeuralCML
 from replay_buffer import ReplayBuffer
 from tasks import feature_dim, obs_to_features, reset_train_env, resolve_env_id, resolve_task_name
 from utils import (
-    compute_obs_stats,
     get_dims,
     make_env,
-    normalize_replay_buffer,
     resolve_device,
     save_checkpoint,
 )
 
 
+DEFAULT_CARTPOLE_RECON_WEIGHTS = [5.0, 1.0, 5.0, 5.0, 1.0]
+
+
 def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(description="训练连续控制任务上的 Neural CML")
-    parser.add_argument("--task", choices=("pendulum", "cartpole"), default="pendulum")
+    parser.add_argument("--task", choices=("pendulum", "cartpole"), default="cartpole")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--total-env-steps", type=int, default=300_000)
     parser.add_argument("--buffer-size", type=int, default=300_000)
-    parser.add_argument("--random-pendulum-theta-range", type=float, default=np.pi)
-    parser.add_argument("--random-pendulum-ang-vel-range", type=float, default=8.0)
-    parser.add_argument("--random-cart-pos-range", type=float, default=2.4)
-    parser.add_argument("--random-pole-angle-range", type=float, default=np.pi)
-    parser.add_argument("--random-cart-vel-range", type=float, default=4.0)
-    parser.add_argument("--random-pole-ang-vel-range", type=float, default=8.0)
     parser.add_argument("--updates", type=int, default=100_000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--recon-weight", type=float, default=0.1)
+    parser.add_argument("--pred-weight", type=float, default=1.0)  #0.01
+    parser.add_argument("--recon-loss-weight", "--recon-weight", dest="recon_weight", type=float, default=1.0)
+    parser.add_argument("--recon-dim-weights", "--recon-weights", dest="recon_weights", type=float, nargs="*", default=None)
     parser.add_argument("--action-norm-weight", type=float, default=1e-4)
+    parser.add_argument("--latent-norm-weight", type=float, default=1e-4)
     parser.add_argument("--save-every", type=int, default=5000)
-    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--run-dir", type=str, default="runs")
     parser.add_argument("--load-run", type=str, default=None, help="checkpoint .pt path or run directory to continue from")
     return parser.parse_args()
@@ -154,17 +152,6 @@ def checkpoint_update_index(checkpoint_path: Path | None) -> int:
     return int(match.group(1))
 
 
-def load_checkpoint_stats(checkpoint_path: Path | None) -> tuple[np.ndarray, np.ndarray] | None:
-    """Load observation normalization stats before collecting a continuation dataset."""
-    if checkpoint_path is None:
-        return None
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    return (
-        np.asarray(ckpt["obs_mean"], dtype=np.float32),
-        np.asarray(ckpt["obs_std"], dtype=np.float32),
-    )
-
-
 def load_model_checkpoint(
     checkpoint_path: Path | None,
     model: NeuralCML,
@@ -191,11 +178,10 @@ def train_model(
     args: argparse.Namespace,
     device: torch.device,
     run_dir: Path,
-    obs_mean: np.ndarray,
-    obs_std: np.ndarray,
     start_update: int = 0,
 ) -> None:
     """执行完整的自监督训练循环。"""
+    recon_weights = build_recon_weights(args.recon_weights, model.obs_dim, device)
     pbar = trange(args.updates, desc="Training CML")  #带进度条的循环
     for local_step in pbar:
         update_idx = start_update + local_step + 1
@@ -204,8 +190,11 @@ def train_model(
             batch.obs,
             batch.actions,
             batch.next_obs,
+            pred_weight=args.pred_weight,
             recon_weight=args.recon_weight,
+            recon_weights=recon_weights,
             action_norm_weight=args.action_norm_weight,
+            latent_norm_weight=args.latent_norm_weight,
         )
         optimizer.zero_grad(set_to_none=True)
         loss_out.total.backward()   #反向传播，计算梯度
@@ -213,10 +202,20 @@ def train_model(
         optimizer.step()  #根据刚算出的梯度，真正修改参数
 
         if update_idx % 100 == 0:
+            pred_loss = args.pred_weight * loss_out.pred.item()
+            recon_loss = args.recon_weight * loss_out.recon.item()
+            action_loss = args.action_norm_weight * loss_out.action_norm.item()
+            latent_loss = args.latent_norm_weight * loss_out.latent_norm.item()
             pbar.set_postfix(
                 total=f"{loss_out.total.item():.4f}",
-                pred=f"{loss_out.pred.item():.4f}",
-                recon=f"{loss_out.recon.item():.4f}",
+                raw_pred=f"{loss_out.pred.item():.4e}",
+                raw_recon=f"{loss_out.recon.item():.4e}",
+                raw_action_norm=f"{loss_out.action_norm.item():.4e}",
+                raw_latent_norm=f"{loss_out.latent_norm.item():.4e}",
+                weighted_pred=f"{pred_loss:.4e}",
+                weighted_recon=f"{recon_loss:.4e}",
+                weighted_action_norm=f"{action_loss:.4e}",
+                weighted_latent_norm=f"{latent_loss:.4e}",
             )
 
         if update_idx % args.save_every == 0 or local_step + 1 == args.updates:
@@ -225,43 +224,28 @@ def train_model(
                 model,
                 optimizer,
                 vars(args) | model_config(model),
-                obs_mean=obs_mean,
-                obs_std=obs_std,
             )
 
 
-def prepare_dataset(args: argparse.Namespace, loaded_stats: tuple[np.ndarray, np.ndarray] | None = None):
-    """创建环境、采样数据并完成标准化。"""
+def prepare_dataset(args: argparse.Namespace):
+    """创建环境并采样训练数据。"""
     args.task = resolve_task_name(args.task)
     args.env_id = resolve_env_id(args.task)
     env = make_env(args.env_id)
     raw_obs_dim, action_dim = get_dims(env)
     obs_dim = feature_dim(args.task, raw_obs_dim)
+    if args.recon_weights is None and args.task == "cartpole":
+        args.recon_weights = DEFAULT_CARTPOLE_RECON_WEIGHTS.copy()
     buffer = ReplayBuffer(obs_dim, action_dim, args.buffer_size)
     collect_random_data(env, buffer, args.total_env_steps, args.seed, args)
 
-    if loaded_stats is not None:
-        obs_mean_np, obs_std_np = loaded_stats
-        if obs_mean_np.shape[0] != obs_dim or obs_std_np.shape[0] != obs_dim:
-            raise ValueError(f"Loaded checkpoint stats do not match obs_dim={obs_dim}.")
-        obs_mean_t = torch.as_tensor(obs_mean_np, dtype=torch.float32)
-        obs_std_t = torch.as_tensor(obs_std_np, dtype=torch.float32)
-        print(f"Loaded observation mean: {obs_mean_t}")
-        print(f"Loaded observation std: {obs_std_t}")
-        normalize_replay_buffer(buffer, obs_mean_t, obs_std_t)
-    else:
-        obs_mean_t, obs_std_t = compute_obs_stats(buffer.obs[: buffer.size])
-        print(f"Observation mean: {obs_mean_t}")
-        print(f"Observation std: {obs_std_t}")
-        normalize_replay_buffer(buffer, obs_mean_t, obs_std_t)
+    print("Observation normalization: disabled")
 
     return SimpleNamespace(
         env=env,
         obs_dim=obs_dim,
         action_dim=action_dim,
         buffer=buffer,
-        obs_mean=obs_mean_t.cpu().numpy(),
-        obs_std=obs_std_t.cpu().numpy(),
     )
 
 
@@ -277,9 +261,8 @@ def main() -> None:
     set_seed(args.seed)
     device = resolve_device(args.device)
     checkpoint_path = resolve_load_checkpoint(args.load_run)
-    loaded_stats = load_checkpoint_stats(checkpoint_path)
 
-    dataset = prepare_dataset(args, loaded_stats=loaded_stats)  #准备buffer并且填充buffer
+    dataset = prepare_dataset(args)  #准备buffer并且填充buffer
     model = build_model(args, dataset.obs_dim, dataset.action_dim, device)
     print_model_size(model, dataset.obs_dim, dataset.action_dim)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
@@ -292,12 +275,19 @@ def main() -> None:
         args,
         device,
         run_dir,
-        dataset.obs_mean,
-        dataset.obs_std,
         start_update=start_update,
     )
     print(f"Saved checkpoints to {run_dir}")
     dataset.env.close()
+
+
+def build_recon_weights(weights: list[float] | None, obs_dim: int, device: torch.device) -> torch.Tensor | None:
+    """Build optional per-observation reconstruction weights."""
+    if weights is None:
+        return None
+    if len(weights) != obs_dim:
+        raise ValueError(f"--recon-dim-weights must contain {obs_dim} values for this task.")
+    return torch.as_tensor(weights, dtype=torch.float32, device=device)
 
 
 if __name__ == "__main__":

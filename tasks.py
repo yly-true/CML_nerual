@@ -33,7 +33,7 @@ def feature_names(task_name: str) -> list[str]:
     if task_name == PENDULUM:
         return ["cos(theta)", "sin(theta)", "thetadot"]
     if task_name == CARTPOLE:
-        return ["x", "sin(theta)", "cos(theta)", "xdot", "thetadot"]
+        return ["x", "xdot", "cos(theta)", "sin(theta)", "thetadot"]
     raise ValueError(f"Unsupported task: {task_name}")
 
 
@@ -51,9 +51,9 @@ def obs_to_features(task_name: str, obs) -> np.ndarray:
     if task_name == CARTPOLE:
         features = np.zeros(obs_arr.shape[:-1] + (5,), dtype=np.float32)
         features[..., 0] = obs_arr[..., 0]
-        features[..., 1] = np.sin(obs_arr[..., 1])
+        features[..., 1] = obs_arr[..., 2]
         features[..., 2] = np.cos(obs_arr[..., 1])
-        features[..., 3] = obs_arr[..., 2]
+        features[..., 3] = np.sin(obs_arr[..., 1])
         features[..., 4] = obs_arr[..., 3]
         return features
     raise ValueError(f"Unsupported task: {task_name}")
@@ -76,7 +76,8 @@ def reset_train_env(task_name: str, env, args: argparse.Namespace, seed: int | N
 
 
 def reset_pendulum_train(env, args: argparse.Namespace, seed: int | None = None) -> np.ndarray:
-    """Reset Pendulum to a broad random angle/angular-velocity state."""
+    """Reset Pendulum to the upright equilibrium state."""
+    _ = args
     if seed is None:
         env.reset()
     else:
@@ -86,26 +87,25 @@ def reset_pendulum_train(env, args: argparse.Namespace, seed: int | None = None)
     if not hasattr(sim, "state"):
         raise RuntimeError("Current Pendulum environment does not expose state.")
 
-    theta_range = abs(args.random_pendulum_theta_range)
-    angular_velocity_range = abs(args.random_pendulum_ang_vel_range)
-    theta = np.random.uniform(-theta_range, theta_range)
-    theta_dot = np.random.uniform(-angular_velocity_range, angular_velocity_range)
+    theta = 0.0
+    theta_dot = 0.0
     sim.state = np.asarray([theta, theta_dot], dtype=np.float32)
     return current_obs(PENDULUM, env)
 
 
 def reset_cartpole_train(env, args: argparse.Namespace, seed: int | None = None) -> np.ndarray:
-    """Reset the cart-pole to a broad random state."""
+    """Reset the cart-pole to x=0, upright pole, and zero velocities."""
+    _ = args
     if seed is None:
         env.reset()
     else:
         env.reset(seed=seed)
 
     sim = env.unwrapped
-    cart_pos = np.random.uniform(-args.random_cart_pos_range, args.random_cart_pos_range)
-    pole_angle = np.random.uniform(-args.random_pole_angle_range, args.random_pole_angle_range)
-    cart_vel = np.random.uniform(-args.random_cart_vel_range, args.random_cart_vel_range)
-    pole_ang_vel = np.random.uniform(-args.random_pole_ang_vel_range, args.random_pole_ang_vel_range)
+    cart_pos = 0.0
+    pole_angle = 0.0
+    cart_vel = 0.0
+    pole_ang_vel = 0.0
     sim.state = np.asarray([cart_pos, pole_angle, cart_vel, pole_ang_vel], dtype=np.float32)
     return current_obs(CARTPOLE, env)
 
@@ -163,7 +163,7 @@ class ContinuousCartPoleEnv(gym.Env):
         self.length = 0.5
         self.polemass_length = self.masspole * self.length
         self.force_mag = 10.0
-        self.tau = 0.02
+        self.tau = 0.05
         self.x_threshold = 4.8
         self.theta_threshold_radians = math.pi
         self.max_episode_steps = 500

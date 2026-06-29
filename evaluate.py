@@ -11,9 +11,9 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from cml_model import CML_HIDDEN_DIMS, CML_LATENT_DIM, NeuralCML, plan_action_random_shooting
+from cml_model import CML_HIDDEN_DIMS, CML_LATENT_DIM, NeuralCML, plan_action_cem, plan_action_random_shooting
 from tasks import feature_dim, feature_names, format_obs, obs_to_features, reset_eval_env, resolve_env_id, resolve_task_name, target_features
-from utils import get_dims, make_env, normalize_obs, resolve_device
+from utils import get_dims, make_env, resolve_device
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,8 +23,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task", choices=("pendulum", "cartpole"), default="pendulum")
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument("--planner", type=str, choices=("random", "cem"), default="cem")
     parser.add_argument("--num-sequences", type=int, default=2048)
-    parser.add_argument("--horizon", type=int, default=1)
+    parser.add_argument("--horizon", type=int, default=10)
+    parser.add_argument("--cem-iterations", type=int, default=4)
+    parser.add_argument("--cem-elite-frac", type=float, default=0.1)
     parser.add_argument("--action-cost", type=float, default=0)
     parser.add_argument("--action-sampling", type=str, choices=("uniform", "gaussian"), default="gaussian")
     parser.add_argument(
@@ -41,7 +44,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         choices=("obsend", "obstraj", "latentend", "latenttraj"),
         default="latentend",
-        help="Random-shooting objective: obsend, obstraj, latentend, or latenttraj.",
+                        help="MPC objective: obsend, obstraj, latentend, or latenttraj.",
     )
     parser.add_argument(
         "--obs-cost-weights",
@@ -101,11 +104,10 @@ def resolve_model_args(ckpt: dict) -> dict[str, object]:
     }
 
 
-def load_model_and_stats(args: argparse.Namespace, action_dim: int, device: torch.device):
-    """从 checkpoint 恢复模型和观测标准化参数。"""
+def load_model(args: argparse.Namespace, obs_dim: int, action_dim: int, device: torch.device):
+    """从 checkpoint 恢复模型。"""
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model_args = resolve_model_args(ckpt)
-    obs_dim = int(np.asarray(ckpt["obs_mean"]).shape[0])
     model = NeuralCML(
         obs_dim=obs_dim,
         action_dim=action_dim,
@@ -115,22 +117,18 @@ def load_model_and_stats(args: argparse.Namespace, action_dim: int, device: torc
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     print_model_size(model, model_args, obs_dim, action_dim)
-    return model, ckpt["obs_mean"], ckpt["obs_std"]
+    return model
 
 
 def prepare_planner_inputs(
     env,
     obs_dim: int,
-    obs_mean,
-    obs_std,
     device: torch.device,
     args: argparse.Namespace,
 ):
     """构造规划阶段反复使用的常量张量。"""
     action_low = torch.as_tensor(env.action_space.low, dtype=torch.float32, device=device)
     action_high = torch.as_tensor(env.action_space.high, dtype=torch.float32, device=device)
-    obs_mean_t = torch.as_tensor(obs_mean, dtype=torch.float32, device=device)
-    obs_std_t = torch.as_tensor(obs_std, dtype=torch.float32, device=device)
     obs_weights_t = None
     if args.obs_cost_weights is not None:
         if len(args.obs_cost_weights) != obs_dim:
@@ -152,8 +150,6 @@ def prepare_planner_inputs(
     return SimpleNamespace(
         action_low=action_low,
         action_high=action_high,
-        obs_mean_t=obs_mean_t,
-        obs_std_t=obs_std_t,
         obs_weights_t=obs_weights_t,
         action_std_t=action_std_t,
     )
@@ -239,13 +235,51 @@ def reset_env_to_initial_state(task_name: str, env, args: argparse.Namespace) ->
     return obs
 
 
+def plan_action_mpc(
+    model: NeuralCML,
+    obs_t: torch.Tensor,
+    goal_t: torch.Tensor,
+    planner_inputs,
+    objective: str,
+    args: argparse.Namespace,
+) -> torch.Tensor:
+    """Plan an action sequence with the learned model and execute the first action."""
+    if args.planner == "cem":
+        return plan_action_cem(
+            model=model,
+            obs=obs_t,
+            goal_obs=goal_t,
+            action_low=planner_inputs.action_low,
+            action_high=planner_inputs.action_high,
+            num_sequences=args.num_sequences,
+            horizon=args.horizon,
+            action_cost=args.action_cost,
+            objective=objective,
+            iterations=args.cem_iterations,
+            elite_frac=args.cem_elite_frac,
+            obs_weights=planner_inputs.obs_weights_t,
+        )
+    return plan_action_random_shooting(
+        model=model,
+        obs=obs_t,
+        goal_obs=goal_t,
+        action_low=planner_inputs.action_low,
+        action_high=planner_inputs.action_high,
+        num_sequences=args.num_sequences,
+        horizon=args.horizon,
+        action_cost=args.action_cost,
+        sampling_dist=args.action_sampling,
+        action_std=planner_inputs.action_std_t,
+        objective=objective,
+        obs_weights=planner_inputs.obs_weights_t,
+    )
+
+
 def run_episode(
     env,
     model: NeuralCML,
     planner_inputs,
     task_name: str,
-    obs_mean,
-    obs_std,
     args: argparse.Namespace,
     device: torch.device,
 ) -> tuple[float, int]:
@@ -263,28 +297,18 @@ def run_episode(
                 continue
 
             obs_features = obs_to_features(task_name, obs)
-            norm_obs = normalize_obs(obs_features.astype(np.float32), obs_mean, obs_std)
-            obs_t = torch.as_tensor(norm_obs, dtype=torch.float32, device=device)
+            obs_t = torch.as_tensor(obs_features.astype(np.float32), dtype=torch.float32, device=device)
 
             goal_features = target_features(task_name, args)
-            norm_goal = normalize_obs(goal_features, obs_mean, obs_std)
-            goal_t = torch.as_tensor(norm_goal, dtype=torch.float32, device=device)
+            goal_t = torch.as_tensor(goal_features.astype(np.float32), dtype=torch.float32, device=device)
 
-            action_t = plan_action_random_shooting(
+            action_t = plan_action_mpc(
                 model=model,
-                obs=obs_t,
-                goal_obs=goal_t,
-                action_low=planner_inputs.action_low,
-                action_high=planner_inputs.action_high,
-                num_sequences=args.num_sequences,
-                horizon=args.horizon,
-                action_cost=args.action_cost,
-                sampling_dist=args.action_sampling,
-                action_std=planner_inputs.action_std_t,
+                obs_t=obs_t,
+                goal_t=goal_t,
+                planner_inputs=planner_inputs,
                 objective=objective,
-                obs_mean=planner_inputs.obs_mean_t,
-                obs_std=planner_inputs.obs_std_t,
-                obs_weights=planner_inputs.obs_weights_t,
+                args=args,
             )
             action = action_t.detach().cpu().numpy()
 
@@ -313,22 +337,17 @@ def main() -> None:
     env = make_env(env_id, render_mode=render_mode)
     raw_obs_dim, action_dim = get_dims(env)
     expected_obs_dim = feature_dim(task_name, raw_obs_dim)
-    model, obs_mean, obs_std = load_model_and_stats(args, action_dim, device)
-    obs_dim = int(np.asarray(obs_mean).shape[0])
-    if obs_dim != expected_obs_dim:
-        raise ValueError(
-            f"Checkpoint obs_dim={obs_dim} does not match task={task_name} feature_dim={expected_obs_dim}. "
-            "Train a checkpoint for the selected task."
-        )
-    planner_inputs = prepare_planner_inputs(env, obs_dim, obs_mean, obs_std, device, args)
+    model = load_model(args, expected_obs_dim, action_dim, device)
+    planner_inputs = prepare_planner_inputs(env, expected_obs_dim, device, args)
 
     print(
         "inference: "
-        f"task={task_name}, env_id={env_id}, mode={args.inference_mode}, planner=random, "
+        f"task={task_name}, env_id={env_id}, mode={args.inference_mode}, planner={args.planner}, "
         f"objective={objective_from_inference_mode(args.inference_mode)}, "
         f"features={feature_names(task_name)}, action_cost={args.action_cost}, "
         f"action_sampling={args.action_sampling}, action_std={args.action_std}, "
-        f"num_sequences={args.num_sequences}, horizon={args.horizon}"
+        f"num_sequences={args.num_sequences}, horizon={args.horizon}, "
+        f"cem_iterations={args.cem_iterations}, cem_elite_frac={args.cem_elite_frac}"
     )
     print(f"target: {target_features(task_name, args)}")
     if args.render:
@@ -345,8 +364,6 @@ def main() -> None:
             model=model,
             planner_inputs=planner_inputs,
             task_name=task_name,
-            obs_mean=obs_mean,
-            obs_std=obs_std,
             args=args,
             device=device,
         )

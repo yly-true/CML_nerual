@@ -39,38 +39,14 @@ def resolve_device(device_name: str) -> torch.device:
     return torch.device("cpu")
 
 
-def compute_obs_stats(obs):
-    """计算观测归一化所需的均值和标准差。"""
-    if isinstance(obs, torch.Tensor):
-        obs_mean = obs.mean(dim=0)
-        obs_std = obs.std(dim=0, unbiased=False) + 1e-6
-        return obs_mean, obs_std
-    obs_mean = obs.mean(axis=0).astype(np.float32)
-    obs_std = obs.std(axis=0).astype(np.float32) + 1e-6
-    return obs_mean, obs_std
-
-
-def normalize_obs(obs, mean, std):
-    """按给定统计量对单条或批量观测做标准化。"""
-    return (obs - mean) / (std + 1e-6)
-
-
-def normalize_replay_buffer(buffer, mean, std) -> None:
-    """原地标准化 replay buffer 中已采集到的观测。"""
-    buffer.obs[: buffer.size] = normalize_obs(buffer.obs[: buffer.size], mean, std)
-    buffer.next_obs[: buffer.size] = normalize_obs(buffer.next_obs[: buffer.size], mean, std)
-
-
-def save_checkpoint(path: Path, model, optimizer, args: Dict[str, Any], obs_mean, obs_std) -> None:
-    """保存模型参数、优化器状态和归一化统计量。"""
+def save_checkpoint(path: Path, model, optimizer, args: Dict[str, Any]) -> None:
+    """保存模型参数和优化器状态。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
             "args": args,
-            "obs_mean": obs_mean,
-            "obs_std": obs_std,
         },
         path,
     )

@@ -11,8 +11,8 @@ import numpy as np
 import torch
 
 from cml_model import CML_HIDDEN_DIMS, CML_LATENT_DIM, NeuralCML
-from tasks import CARTPOLE, obs_to_features, resolve_env_id, resolve_task_name
-from utils import get_dims, make_env, normalize_obs, resolve_device
+from tasks import CARTPOLE, PENDULUM, feature_dim, obs_to_features, resolve_env_id, resolve_task_name
+from utils import get_dims, make_env, resolve_device
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,8 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--action-mode", choices=("random", "sine", "zero"), default="sine")
     parser.add_argument("--action-std", type=float, default=0.8)
-    parser.add_argument("--sine-amplitude", type=float, default=1.5)
-    parser.add_argument("--sine-period", type=float, default=50.0)
+    parser.add_argument("--sine-amplitude", type=float, default=3)
+    parser.add_argument("--sine-period", type=float, default=30.0)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--output", type=str, default=None, help="Optional .gif or .mp4 output path.")
     parser.add_argument("--show", action="store_true", help="Open an interactive matplotlib window.")
@@ -49,7 +49,7 @@ def resolve_checkpoint(task_name: str, checkpoint: str | None) -> str:
     return str(candidates[0])
 
 
-def load_model(checkpoint: str, action_dim: int, device: torch.device):
+def load_model(checkpoint: str, obs_dim: int, action_dim: int, device: torch.device):
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
     saved_args = ckpt.get("args", {})
     if "hidden_dims" in saved_args:
@@ -62,7 +62,6 @@ def load_model(checkpoint: str, action_dim: int, device: torch.device):
         "latent_dim": int(saved_args.get("latent_dim", CML_LATENT_DIM)),
         "hidden_dims": hidden_dims,
     }
-    obs_dim = int(np.asarray(ckpt["obs_mean"]).shape[0])
     model = NeuralCML(
         obs_dim=obs_dim,
         action_dim=action_dim,
@@ -71,11 +70,7 @@ def load_model(checkpoint: str, action_dim: int, device: torch.device):
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    return model, np.asarray(ckpt["obs_mean"], dtype=np.float32), np.asarray(ckpt["obs_std"], dtype=np.float32)
-
-
-def denormalize_obs(obs: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
-    return obs * (std + 1e-6) + mean
+    return model
 
 
 def generate_actions(args: argparse.Namespace, env) -> np.ndarray:
@@ -97,40 +92,48 @@ def generate_actions(args: argparse.Namespace, env) -> np.ndarray:
     return np.clip(actions, action_low, action_high)
 
 
+def reset_visual_env_down(task_name: str, env, seed: int) -> np.ndarray:
+    """Reset visualization rollout with the rod pointing downward."""
+    env.reset(seed=seed)
+    sim = env.unwrapped
+    if task_name == PENDULUM:
+        sim.state = np.asarray([np.pi, 0.0], dtype=np.float32)
+        return np.asarray(sim._get_obs(), dtype=np.float32)
+    if task_name == CARTPOLE:
+        sim.state = np.asarray([0.0, np.pi - 1e-6, 0.0, 0.0], dtype=np.float32)
+        return sim.state.copy()
+    raise ValueError(f"Unsupported task: {task_name}")
+
+
 @torch.no_grad()
 def predict_next_obs(
     model: NeuralCML,
     obs: np.ndarray,
     action: np.ndarray,
-    obs_mean: np.ndarray,
-    obs_std: np.ndarray,
     device: torch.device,
 ) -> np.ndarray:
-    norm_obs = normalize_obs(obs.astype(np.float32), obs_mean, obs_std)
-    obs_t = torch.as_tensor(norm_obs, dtype=torch.float32, device=device).view(1, -1)
+    obs_t = torch.as_tensor(obs.astype(np.float32), dtype=torch.float32, device=device).view(1, -1)
     action_t = torch.as_tensor(action, dtype=torch.float32, device=device).view(1, -1)
     state = model.encode(obs_t)
     next_state = model.transition(state, action_t)
-    next_norm_obs = model.decode(next_state).detach().cpu().numpy()[0]
-    return denormalize_obs(next_norm_obs, obs_mean, obs_std).astype(np.float32)
+    return model.decode(next_state).detach().cpu().numpy()[0].astype(np.float32)
 
 
-def rollout(args: argparse.Namespace, model: NeuralCML, obs_mean: np.ndarray, obs_std: np.ndarray, device: torch.device):
+def rollout(args: argparse.Namespace, model: NeuralCML, device: torch.device):
     task_name = resolve_task_name(args.task)
     env = make_env(resolve_env_id(task_name))
     _, action_dim = get_dims(env)
     actions = generate_actions(args, env)
 
-    real_obs, _ = env.reset(seed=args.seed)
-    real_obs = np.asarray(real_obs, dtype=np.float32)
-    model_features = obs_to_features(task_name, real_obs)
+    real_obs = reset_visual_env_down(task_name, env, args.seed)
     real_traj = [real_obs]
-    model_traj = [model_features.copy()]
+    model_traj = [obs_to_features(task_name, real_obs)]
     for action in actions:
+        current_features = obs_to_features(task_name, real_obs)
+        predicted_next_features = predict_next_obs(model, current_features, action, device)
         real_obs, _, terminated, truncated, _ = env.step(action)
-        model_features = predict_next_obs(model, model_features, action, obs_mean, obs_std, device)
         real_traj.append(np.asarray(real_obs, dtype=np.float32))
-        model_traj.append(model_features.copy())
+        model_traj.append(predicted_next_features.copy())
         if terminated or truncated:
             break
 
@@ -141,7 +144,7 @@ def rollout(args: argparse.Namespace, model: NeuralCML, obs_mean: np.ndarray, ob
 
 def theta(task_name: str, obs: np.ndarray) -> np.ndarray:
     if task_name == CARTPOLE:
-        return np.arctan2(obs[..., 1], obs[..., 2])
+        return np.arctan2(obs[..., 3], obs[..., 2])
     return np.arctan2(obs[..., 1], obs[..., 0])
 
 
@@ -154,10 +157,22 @@ def make_animation(real_traj: np.ndarray, model_traj: np.ndarray, actions: np.nd
     task_name = resolve_task_name(args.task)
     frames = len(real_traj)
     real_features = obs_to_features(task_name, real_traj)
-    real_theta = theta(task_name, real_features)
-    model_theta = theta(task_name, model_traj)
-    real_thetadot = real_features[:, -1]
-    model_thetadot = model_traj[:, -1]
+    real_theta = np.unwrap(theta(task_name, real_features))
+    model_theta = np.unwrap(theta(task_name, model_traj))
+    if task_name == CARTPOLE:
+        lower_title = "Cart position and action"
+        lower_ylabel = "x"
+        real_lower = real_features[:, 0]
+        model_lower = model_traj[:, 0]
+        real_lower_label = "real x"
+        model_lower_label = "model x"
+    else:
+        lower_title = "Angular velocity and action"
+        lower_ylabel = "thetadot"
+        real_lower = real_features[:, 2]
+        model_lower = model_traj[:, 2]
+        real_lower_label = "real thetadot"
+        model_lower_label = "model thetadot"
     t = np.arange(frames)
 
     fig = plt.figure(figsize=(11, 5))
@@ -166,7 +181,7 @@ def make_animation(real_traj: np.ndarray, model_traj: np.ndarray, actions: np.nd
     ax_angle = fig.add_subplot(gs[0, 1])
     ax_vel = fig.add_subplot(gs[1, 1])
 
-    ax_pendulum.set_title(f"{task_name} rollout: real vs model")
+    ax_pendulum.set_title(f"{task_name} one-step prediction: real vs model")
     ax_pendulum.set_xlim(-4.8, 4.8) if task_name == CARTPOLE else ax_pendulum.set_xlim(-1.25, 1.25)
     ax_pendulum.set_ylim(-1.25, 1.25)
     ax_pendulum.set_aspect("equal")
@@ -188,14 +203,14 @@ def make_animation(real_traj: np.ndarray, model_traj: np.ndarray, actions: np.nd
     ax_angle.legend(loc="upper right")
 
     action_t = np.arange(len(actions))
-    ax_vel.set_title("Angular velocity and action")
-    ax_vel.plot(t, real_thetadot, color="#1f77b4", label="real thetadot")
-    ax_vel.plot(t, model_thetadot, color="#ff7f0e", linestyle="--", label="model thetadot")
+    ax_vel.set_title(lower_title)
+    ax_vel.plot(t, real_lower, color="#1f77b4", label=real_lower_label)
+    ax_vel.plot(t, model_lower, color="#ff7f0e", linestyle="--", label=model_lower_label)
     ax_action = ax_vel.twinx()
     ax_action.plot(action_t, actions[:, 0], color="#2ca02c", alpha=0.45, label="action")
     vel_cursor = ax_vel.axvline(0, color="black", alpha=0.35)
     ax_vel.set_xlabel("step")
-    ax_vel.set_ylabel("thetadot")
+    ax_vel.set_ylabel(lower_ylabel)
     ax_action.set_ylabel("action")
     ax_vel.grid(True, alpha=0.25)
 
@@ -217,7 +232,7 @@ def make_animation(real_traj: np.ndarray, model_traj: np.ndarray, actions: np.nd
         angle_cursor.set_xdata([frame, frame])
         vel_cursor.set_xdata([frame, frame])
         error = float(np.linalg.norm(real_features[frame] - model_traj[frame]))
-        time_text.set_text(f"step={frame}\nobs_error={error:.3f}")
+        time_text.set_text(f"step={frame}\none_step_error={error:.3f}")
         return real_line, model_line, real_bob, model_bob, angle_cursor, vel_cursor, time_text
 
     return FuncAnimation(fig, update, frames=frames, interval=1000 / args.fps, blit=True)
@@ -242,11 +257,12 @@ def main() -> None:
     print(f"Using checkpoint: {checkpoint}")
     device = resolve_device(args.device)
     env = make_env(resolve_env_id(args.task))
-    _, action_dim = get_dims(env)
+    raw_obs_dim, action_dim = get_dims(env)
+    obs_dim = feature_dim(args.task, raw_obs_dim)
     env.close()
 
-    model, obs_mean, obs_std = load_model(checkpoint, action_dim, device)
-    real_traj, model_traj, actions, _ = rollout(args, model, obs_mean, obs_std, device)
+    model = load_model(checkpoint, obs_dim, action_dim, device)
+    real_traj, model_traj, actions, _ = rollout(args, model, device)
     anim = make_animation(real_traj, model_traj, actions, args)
 
     if args.output is not None:

@@ -9,9 +9,14 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-
-CML_LATENT_DIM = 128
+CML_LATENT_DIM = 16
 CML_HIDDEN_DIMS = [64, 64]
+
+# CML_LATENT_DIM = 128
+# CML_HIDDEN_DIMS = [64, 64]
+
+# CML_LATENT_DIM = 512
+# CML_HIDDEN_DIMS = [16, 64, 64]
 
 
 def mlp(input_dim: int, hidden_dims: Sequence[int], output_dim: int) -> nn.Sequential:
@@ -36,6 +41,7 @@ class CMLLossOutput:
     pred: torch.Tensor
     recon: torch.Tensor
     action_norm: torch.Tensor
+    latent_norm: torch.Tensor
 
 
 class NeuralCML(nn.Module):
@@ -101,7 +107,9 @@ class NeuralCML(nn.Module):
         next_obs: torch.Tensor,
         pred_weight: float = 1.0,
         recon_weight: float = 0.05,
+        recon_weights: torch.Tensor | None = None,
         action_norm_weight: float = 1e-4,
+        latent_norm_weight: float = 1e-4,
     ) -> CMLLossOutput:
         """计算训练损失。
 
@@ -120,18 +128,28 @@ class NeuralCML(nn.Module):
         # 重建项防止 latent 只会做转移预测，却丢失观测信息。
         obs_hat = self.decode(state)
         next_obs_hat = self.decode(next_state_hat)
-        recon = 0.5 * F.mse_loss(obs_hat, obs) + 0.5 * F.mse_loss(next_obs_hat, next_obs)
+        recon = 0.5 * weighted_mse(obs_hat, obs, recon_weights) + 0.5 * weighted_mse(next_obs_hat, next_obs, recon_weights)
 
         # 正则项约束 latent 几何不要过度发散。
         action_delta = self.action_delta(state, action)
         action_norm = action_delta.pow(2).mean()
+        latent_norm = 0.5 * state.pow(2).mean() + 0.5 * next_state_hat.pow(2).mean()
 
         total = (
             pred_weight * pred
             + recon_weight * recon
             + action_norm_weight * action_norm
+            + latent_norm_weight * latent_norm
         )
-        return CMLLossOutput(total, pred, recon, action_norm)
+        return CMLLossOutput(total, pred, recon, action_norm, latent_norm)
+
+
+def weighted_mse(pred: torch.Tensor, target: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
+    """MSE with optional per-observation-dimension weights."""
+    err = (pred - target).pow(2)
+    if weights is not None:
+        err = err * weights.to(device=pred.device, dtype=pred.dtype).view(1, -1)
+    return err.mean()
 
 
 @torch.no_grad()
@@ -239,8 +257,6 @@ def score_action_sequences(
     actions: torch.Tensor,
     action_cost: float = 0.001,
     objective: str = "latent-terminal",
-    obs_mean: torch.Tensor | None = None,
-    obs_std: torch.Tensor | None = None,
     obs_weights: torch.Tensor | None = None,
     terminal_weight: float = 1.0,
 ) -> torch.Tensor:
@@ -271,8 +287,6 @@ def score_action_sequences(
         weights = _normalize_weights(None, model.latent_dim, device)
     else:
         goal_raw = goal_batch
-        if obs_mean is not None and obs_std is not None:
-            goal_raw = goal_raw * obs_std.view(1, -1) + obs_mean.view(1, -1)
         weights = _normalize_weights(obs_weights, model.obs_dim, device)
 
     distance_cost = torch.zeros(num_sequences, device=device)
@@ -287,8 +301,6 @@ def score_action_sequences(
                 step_distance = ((state - goal_state).pow(2) * weights.view(1, -1)).mean(dim=-1)
             else:
                 pred_obs = model.decode(state)
-                if obs_mean is not None and obs_std is not None:
-                    pred_obs = pred_obs * obs_std.view(1, -1) + obs_mean.view(1, -1)
                 step_distance = ((pred_obs - goal_raw).pow(2) * weights.view(1, -1)).mean(dim=-1)
             distance_cost += step_distance
 
@@ -297,8 +309,6 @@ def score_action_sequences(
             terminal_distance = ((state - goal_state).pow(2) * weights.view(1, -1)).mean(dim=-1)
         else:
             pred_obs = model.decode(state)
-            if obs_mean is not None and obs_std is not None:
-                pred_obs = pred_obs * obs_std.view(1, -1) + obs_mean.view(1, -1)
             terminal_distance = ((pred_obs - goal_raw).pow(2) * weights.view(1, -1)).mean(dim=-1)
         distance_cost = terminal_weight * terminal_distance
     else:
@@ -321,8 +331,6 @@ def plan_action_random_shooting(
     sampling_dist: str = "gaussian",
     action_std: torch.Tensor | None = None,
     objective: str = "latent-terminal",
-    obs_mean: torch.Tensor | None = None,
-    obs_std: torch.Tensor | None = None,
     obs_weights: torch.Tensor | None = None,
     terminal_weight: float = 1.0,
 ) -> torch.Tensor:
@@ -346,8 +354,6 @@ def plan_action_random_shooting(
         actions=actions,
         action_cost=action_cost,
         objective=objective,
-        obs_mean=obs_mean,
-        obs_std=obs_std,
         obs_weights=obs_weights,
         terminal_weight=terminal_weight,
     )
@@ -370,8 +376,6 @@ def plan_action_cem(
     elite_frac: float = 0.1,
     init_std_scale: float = 0.5,
     min_std: float = 1e-3,
-    obs_mean: torch.Tensor | None = None,
-    obs_std: torch.Tensor | None = None,
     obs_weights: torch.Tensor | None = None,
     terminal_weight: float = 1.0,
 ) -> torch.Tensor:
@@ -397,8 +401,6 @@ def plan_action_cem(
             actions=actions,
             action_cost=action_cost,
             objective=objective,
-            obs_mean=obs_mean,
-            obs_std=obs_std,
             obs_weights=obs_weights,
             terminal_weight=terminal_weight,
         )
