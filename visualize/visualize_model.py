@@ -19,14 +19,14 @@ from cml.cml_model import (
     CML_SNN_TIMESTEPS,
     NeuralCML,
 )
-from cml.tasks import CARTPOLE, PENDULUM, feature_dim, obs_to_features, resolve_env_id, resolve_task_name
+from cml.tasks import BIPEDALWALKER, CARTPOLE, PENDULUM, feature_dim, obs_to_features, resolve_env_id, resolve_task_name
 from cml.utils import get_dims, make_env, resolve_device
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="可视化 Pendulum-v1 Neural CML 虚拟仿真器")
     parser.add_argument("--checkpoint", type=str, default=None, help="默认自动使用 runs 里的最新 checkpoint。")
-    parser.add_argument("--task", choices=("pendulum", "cartpole"), default="pendulum")
+    parser.add_argument("--task", choices=("pendulum", "cartpole", "bipedalwalker"), default="pendulum")
     parser.add_argument("--steps", type=int, default=80)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cpu")
@@ -120,6 +120,9 @@ def reset_visual_env_down(task_name: str, env, seed: int) -> np.ndarray:
     if task_name == CARTPOLE:
         sim.state = np.asarray([0.0, np.pi - 1e-6, 0.0, 0.0], dtype=np.float32)
         return sim.state.copy()
+    if task_name == BIPEDALWALKER:
+        obs, _ = env.reset(seed=seed)
+        return np.asarray(obs, dtype=np.float32)
     raise ValueError(f"Unsupported task: {task_name}")
 
 
@@ -173,6 +176,9 @@ def rod_xy(task_name: str, obs: np.ndarray) -> tuple[float, float]:
 
 def make_animation(real_traj: np.ndarray, model_traj: np.ndarray, actions: np.ndarray, args: argparse.Namespace) -> FuncAnimation:
     task_name = resolve_task_name(args.task)
+    if task_name == BIPEDALWALKER:
+        return make_feature_animation(real_traj, model_traj, actions, args)
+
     frames = len(real_traj)
     real_features = obs_to_features(task_name, real_traj)
     real_theta = np.unwrap(theta(task_name, real_features))
@@ -252,6 +258,55 @@ def make_animation(real_traj: np.ndarray, model_traj: np.ndarray, actions: np.nd
         error = float(np.linalg.norm(real_features[frame] - model_traj[frame]))
         time_text.set_text(f"step={frame}\none_step_error={error:.3f}")
         return real_line, model_line, real_bob, model_bob, angle_cursor, vel_cursor, time_text
+
+    return FuncAnimation(fig, update, frames=frames, interval=1000 / args.fps, blit=True)
+
+
+def make_feature_animation(real_traj: np.ndarray, model_traj: np.ndarray, actions: np.ndarray, args: argparse.Namespace) -> FuncAnimation:
+    """Animate one-step prediction errors for high-dimensional raw observations."""
+    task_name = resolve_task_name(args.task)
+    real_features = obs_to_features(task_name, real_traj)
+    frames = len(real_features)
+    t = np.arange(frames)
+
+    labels = ["hull angle", "hull angular velocity", "horizontal velocity", "vertical velocity"]
+    feature_count = min(4, real_features.shape[-1])
+    action_count = actions.shape[-1] if len(actions) > 0 else 0
+
+    fig, axes = plt.subplots(2, 1, figsize=(11, 6), sharex=True)
+    ax_features, ax_actions = axes
+    ax_features.set_title(f"{task_name} one-step prediction: real vs model")
+    ax_features.set_ylabel("feature value")
+    ax_features.grid(True, alpha=0.25)
+    ax_actions.set_title("Actions")
+    ax_actions.set_xlabel("step")
+    ax_actions.set_ylabel("action")
+    ax_actions.grid(True, alpha=0.25)
+
+    colors = ["#1f77b4", "#2ca02c", "#9467bd", "#8c564b"]
+    for idx in range(feature_count):
+        label = labels[idx] if idx < len(labels) else f"obs_{idx}"
+        color = colors[idx % len(colors)]
+        ax_features.plot(t, real_features[:, idx], color=color, label=f"real {label}")
+        ax_features.plot(t, model_traj[:, idx], color=color, linestyle="--", alpha=0.85, label=f"model {label}")
+
+    action_t = np.arange(len(actions))
+    for idx in range(action_count):
+        ax_actions.plot(action_t, actions[:, idx], alpha=0.85, label=f"action {idx}")
+
+    feature_cursor = ax_features.axvline(0, color="black", alpha=0.35)
+    action_cursor = ax_actions.axvline(0, color="black", alpha=0.35)
+    error_text = ax_features.text(0.01, 0.97, "", transform=ax_features.transAxes, va="top")
+    ax_features.legend(loc="upper right", ncol=2, fontsize=8)
+    ax_actions.legend(loc="upper right", ncol=2, fontsize=8)
+    fig.tight_layout()
+
+    def update(frame: int):
+        feature_cursor.set_xdata([frame, frame])
+        action_cursor.set_xdata([frame, frame])
+        error = float(np.linalg.norm(real_features[frame] - model_traj[frame]))
+        error_text.set_text(f"step={frame}\none_step_error={error:.3f}")
+        return feature_cursor, action_cursor, error_text
 
     return FuncAnimation(fig, update, frames=frames, interval=1000 / args.fps, blit=True)
 

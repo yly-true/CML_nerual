@@ -38,7 +38,7 @@ from cml.utils import (
 
 
 DEFAULT_CARTPOLE_RECON_WEIGHTS = [5.0, 1.0, 5.0, 5.0, 1.0]
-DEFAULT_BIPEDALWALKER_RECON_WEIGHTS = [2.0, 1.0, 3.0, 3.0] + [1.0] * 20
+DEFAULT_BIPEDALWALKER_RECON_WEIGHTS = [2.0, 1.0, 3.0, 3.0] + [1.0] * 10
 
 
 def parse_args() -> argparse.Namespace:

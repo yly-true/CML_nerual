@@ -37,7 +37,22 @@ def feature_names(task_name: str) -> list[str]:
     if task_name == CARTPOLE:
         return ["x", "xdot", "cos(theta)", "sin(theta)", "thetadot"]
     if task_name == BIPEDALWALKER:
-        return [f"obs_{idx}" for idx in range(24)]
+        return [
+            "hull_angle",
+            "hull_angular_velocity",
+            "horizontal_velocity",
+            "vertical_velocity",
+            "hip_1_angle",
+            "hip_1_speed",
+            "knee_1_angle",
+            "knee_1_speed",
+            "leg_1_ground_contact",
+            "hip_2_angle",
+            "hip_2_speed",
+            "knee_2_angle",
+            "knee_2_speed",
+            "leg_2_ground_contact",
+        ]
     raise ValueError(f"Unsupported task: {task_name}")
 
 
@@ -55,7 +70,7 @@ def feature_dim(task_name: str, raw_obs_dim: int) -> int:
     if task_name == CARTPOLE:
         return 5
     if task_name == BIPEDALWALKER:
-        return 24
+        return 14
     raise ValueError(f"Unsupported task: {task_name}")
 
 
@@ -72,7 +87,7 @@ def obs_to_features(task_name: str, obs) -> np.ndarray:
         features[..., 4] = obs_arr[..., 3]
         return features
     if task_name == BIPEDALWALKER:
-        return obs_arr
+        return obs_arr[..., :14]
     raise ValueError(f"Unsupported task: {task_name}")
 
 
@@ -82,7 +97,7 @@ def target_features(task_name: str, args: argparse.Namespace) -> np.ndarray:
     if task_name == CARTPOLE:
         return np.asarray([args.target_cart_position, 0.0, 1.0, 0.0, 0.0], dtype=np.float32)
     if task_name == BIPEDALWALKER:
-        target = np.zeros(24, dtype=np.float32)
+        target = np.zeros(14, dtype=np.float32)
         target[0] = args.target_bipedalwalker_hull_angle
         target[1] = args.target_bipedalwalker_hull_angular_velocity
         target[2] = args.target_bipedalwalker_horizontal_velocity

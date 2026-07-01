@@ -28,7 +28,7 @@ bipedalwalker: BipedalWalker-v3
 ```text
 pendulum: [cos(theta), sin(theta), thetadot]
 cartpole: [x, xdot, cos(theta), sin(theta), thetadot]
-bipedalwalker: Gymnasium 原始 24 维观测
+bipedalwalker: 原始观测去掉 10 个 lidar 后的前 14 维状态
 ```
 
 ## 安装
@@ -114,6 +114,7 @@ python -m evaluate.evaluate --task cartpole --checkpoint runs\ContinuousCartPole
 ```powershell
 python -m visualize.visualize_model --task pendulum --show
 python -m visualize.visualize_model --task cartpole --show
+python -m visualize.visualize_model --task bipedalwalker --show
 ```
 
 指定 checkpoint 可视化：
@@ -124,6 +125,7 @@ python -m visualize.visualize_model --task cartpole --checkpoint "$ckpt" --show
 ```
 
 Pendulum 会显示角度、角速度和动作；CartPole 会显示角度、小车位置和动作。
+BipedalWalker 会显示关键观测维度的 one-step 预测曲线和 4 维动作曲线。
 
 保存 GIF：
 
