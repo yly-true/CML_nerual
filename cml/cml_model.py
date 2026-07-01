@@ -9,14 +9,106 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-CML_LATENT_DIM = 16
-CML_HIDDEN_DIMS = [64, 64]
+CML_LATENT_DIM = 32
+CML_HIDDEN_DIMS = [128, 128]
+CML_NETWORK_TYPE = "snn"
+CML_SNN_TIMESTEPS = 16
+CML_SNN_TAU = 2.0
+CML_SNN_THRESHOLD = 0.5
+CML_SNN_SURROGATE_SCALE = 10.0
 
 # CML_LATENT_DIM = 128
 # CML_HIDDEN_DIMS = [64, 64]
 
 # CML_LATENT_DIM = 512
 # CML_HIDDEN_DIMS = [16, 64, 64]
+# 1.同类任务下别人怎么做
+# 2.多任务，比如组里的脉轮   ②
+# 3.MLP更换为SNN，神经元换为LIF   ①
+
+
+
+class SurrogateSpike(torch.autograd.Function):
+    """Heaviside spike with a smooth surrogate gradient."""
+
+    @staticmethod
+    def forward(ctx, membrane_minus_threshold: torch.Tensor, scale: float) -> torch.Tensor:
+        ctx.save_for_backward(membrane_minus_threshold)
+        ctx.scale = scale
+        return (membrane_minus_threshold >= 0).to(membrane_minus_threshold.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        (membrane_minus_threshold,) = ctx.saved_tensors
+        scale = ctx.scale
+        grad = 1.0 / (scale * membrane_minus_threshold.abs() + 1.0).pow(2)
+        return grad_output * grad, None
+
+
+def spike_fn(membrane_minus_threshold: torch.Tensor, scale: float) -> torch.Tensor:
+    return SurrogateSpike.apply(membrane_minus_threshold, scale)
+
+
+class LIFBlock(nn.Module):
+    """Linear layer followed by a leaky integrate-and-fire neuron."""
+
+    def __init__(self, input_dim: int, output_dim: int, tau: float, threshold: float, surrogate_scale: float) -> None:
+        super().__init__()
+        if tau <= 1.0:
+            raise ValueError("SNN tau must be greater than 1.0.")
+        self.linear = nn.Linear(input_dim, output_dim)
+        self.decay = 1.0 - 1.0 / tau
+        self.threshold = threshold
+        self.surrogate_scale = surrogate_scale
+
+    def forward(self, x: torch.Tensor, membrane: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        current = self.linear(x)
+        if membrane is None:
+            membrane = torch.zeros_like(current)
+        membrane = self.decay * membrane + current
+        spike = spike_fn(membrane - self.threshold, self.surrogate_scale)
+        membrane = membrane * (1.0 - spike.detach())
+        return spike, membrane
+
+
+class SNN(nn.Module):
+    """Static-input feed-forward SNN with LIF hidden layers and averaged readout."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dims: Sequence[int],
+        output_dim: int,
+        timesteps: int = CML_SNN_TIMESTEPS,
+        tau: float = CML_SNN_TAU,
+        threshold: float = CML_SNN_THRESHOLD,
+        surrogate_scale: float = CML_SNN_SURROGATE_SCALE,
+    ) -> None:
+        super().__init__()
+        if timesteps < 1:
+            raise ValueError("SNN timesteps must be at least 1.")
+        self.timesteps = int(timesteps)
+        self.tau = float(tau)
+        self.threshold = float(threshold)
+        self.surrogate_scale = float(surrogate_scale)
+
+        blocks = []
+        last_dim = input_dim
+        for hidden_dim in hidden_dims:
+            blocks.append(LIFBlock(last_dim, hidden_dim, tau, threshold, surrogate_scale))
+            last_dim = hidden_dim
+        self.blocks = nn.ModuleList(blocks)
+        self.readout = nn.Linear(last_dim, output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        membranes: list[torch.Tensor | None] = [None] * len(self.blocks)
+        output = torch.zeros((*x.shape[:-1], self.readout.out_features), dtype=x.dtype, device=x.device)
+        for _ in range(self.timesteps):
+            spikes = x
+            for index, block in enumerate(self.blocks):
+                spikes, membranes[index] = block(spikes, membranes[index])
+            output = output + self.readout(spikes)
+        return output / self.timesteps
 
 
 def mlp(input_dim: int, hidden_dims: Sequence[int], output_dim: int) -> nn.Sequential:
@@ -31,6 +123,32 @@ def mlp(input_dim: int, hidden_dims: Sequence[int], output_dim: int) -> nn.Seque
         last_dim = hidden_dim
     layers.append(nn.Linear(last_dim, output_dim))
     return nn.Sequential(*layers)
+
+
+def build_network(
+    input_dim: int,
+    hidden_dims: Sequence[int],
+    output_dim: int,
+    network_type: str = CML_NETWORK_TYPE,
+    snn_timesteps: int = CML_SNN_TIMESTEPS,
+    snn_tau: float = CML_SNN_TAU,
+    snn_threshold: float = CML_SNN_THRESHOLD,
+    snn_surrogate_scale: float = CML_SNN_SURROGATE_SCALE,
+) -> nn.Module:
+    """Build either a ReLU MLP or an LIF SNN with the same I/O shape."""
+    if network_type == "mlp":
+        return mlp(input_dim, hidden_dims, output_dim)
+    if network_type == "snn":
+        return SNN(
+            input_dim=input_dim,
+            hidden_dims=hidden_dims,
+            output_dim=output_dim,
+            timesteps=snn_timesteps,
+            tau=snn_tau,
+            threshold=snn_threshold,
+            surrogate_scale=snn_surrogate_scale,
+        )
+    raise ValueError(f"Unsupported network_type: {network_type}")
 
 
 @dataclass
@@ -63,6 +181,11 @@ class NeuralCML(nn.Module):
         action_dim: int,
         latent_dim: int = CML_LATENT_DIM,
         hidden_dims: Sequence[int] | None = None,
+        network_type: str = CML_NETWORK_TYPE,
+        snn_timesteps: int = CML_SNN_TIMESTEPS,
+        snn_tau: float = CML_SNN_TAU,
+        snn_threshold: float = CML_SNN_THRESHOLD,
+        snn_surrogate_scale: float = CML_SNN_SURROGATE_SCALE,
     ) -> None:
         super().__init__()
         if hidden_dims is None:
@@ -72,10 +195,42 @@ class NeuralCML(nn.Module):
         self.action_dim = action_dim
         self.latent_dim = latent_dim
         self.hidden_dims = hidden_dims
+        self.network_type = network_type
+        self.snn_timesteps = int(snn_timesteps)
+        self.snn_tau = float(snn_tau)
+        self.snn_threshold = float(snn_threshold)
+        self.snn_surrogate_scale = float(snn_surrogate_scale)
 
-        self.encoder = mlp(obs_dim, hidden_dims, latent_dim)
-        self.decoder = mlp(latent_dim, hidden_dims, obs_dim)
-        self.action_encoder = mlp(latent_dim + action_dim, hidden_dims, latent_dim)
+        self.encoder = build_network(
+            obs_dim,
+            hidden_dims,
+            latent_dim,
+            network_type,
+            self.snn_timesteps,
+            self.snn_tau,
+            self.snn_threshold,
+            self.snn_surrogate_scale,
+        )
+        self.decoder = build_network(
+            latent_dim,
+            hidden_dims,
+            obs_dim,
+            network_type,
+            self.snn_timesteps,
+            self.snn_tau,
+            self.snn_threshold,
+            self.snn_surrogate_scale,
+        )
+        self.action_encoder = build_network(
+            latent_dim + action_dim,
+            hidden_dims,
+            latent_dim,
+            network_type,
+            self.snn_timesteps,
+            self.snn_tau,
+            self.snn_threshold,
+            self.snn_surrogate_scale,
+        )
 
     def encode(self, obs: torch.Tensor) -> torch.Tensor:
         """将观测编码到 latent state。"""

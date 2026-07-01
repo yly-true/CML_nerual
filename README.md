@@ -98,7 +98,7 @@ python -m evaluate.evaluate --task cartpole --checkpoint "$ckpt" --episodes 3 --
 
 ```powershell
 python -m evaluate.evaluate --task cartpole --checkpoint "$ckpt" --planner cem --horizon 10 --num-sequences 2048 --device cuda --render
-python -m evaluate.evaluate --task cartpole --checkpoint "$ckpt" --planner random --horizon 10 --num-sequences 4096 --device cuda --render
+python -m evaluate.evaluate --task cartpole --checkpoint runs\ContinuousCartPole_v0\20260629_155639\model_200000.pt --planner random --horizon 10 --num-sequences 4096 --device cuda --render --target-cart-position 0.0
 ```
 
 ## 可视化
@@ -132,7 +132,23 @@ python -m visualize.visualize_model --task cartpole --checkpoint "$ckpt" --outpu
 ```python
 CML_LATENT_DIM = 512
 CML_HIDDEN_DIMS = [16, 64, 64]
+CML_NETWORK_TYPE = "snn"
+CML_SNN_TIMESTEPS = 16
+CML_SNN_TAU = 2.0
+CML_SNN_THRESHOLD = 0.5
 ```
 
 `CML_HIDDEN_DIMS` 中每个数字对应一层隐藏层宽度。
-每个隐藏层使用硬件友好的 `Linear -> ReLU`，没有 LayerNorm。
+默认网络为 SNN：每个隐藏层使用 `Linear -> LIF spike`，输出层使用线性读出并对时间步求平均。
+当前默认配置为 `latent_dim=32`、`hidden_dims=[128, 128]`、`snn_timesteps=16`、`threshold=0.5`。
+训练时也可以通过命令行临时切回 MLP：
+
+```powershell
+python -m train.train_cml_pendulum --task cartpole --network-type mlp --device cuda
+```
+
+CUDA 训练默认开启 AMP 混合精度以加速；如需关闭：
+
+```powershell
+python -m train.train_cml_pendulum --task cartpole --device cuda --no-amp
+```

@@ -11,7 +11,17 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from cml.cml_model import CML_HIDDEN_DIMS, CML_LATENT_DIM, NeuralCML, plan_action_cem, plan_action_random_shooting
+from cml.cml_model import (
+    CML_HIDDEN_DIMS,
+    CML_LATENT_DIM,
+    CML_SNN_SURROGATE_SCALE,
+    CML_SNN_TAU,
+    CML_SNN_THRESHOLD,
+    CML_SNN_TIMESTEPS,
+    NeuralCML,
+    plan_action_cem,
+    plan_action_random_shooting,
+)
 from cml.tasks import feature_dim, feature_names, format_obs, obs_to_features, reset_eval_env, resolve_env_id, resolve_task_name, target_features
 from cml.utils import get_dims, make_env, resolve_device
 
@@ -21,8 +31,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="评估连续控制任务上的 Neural CML")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--task", choices=("pendulum", "cartpole"), default="pendulum")
-    parser.add_argument("--episodes", type=int, default=100)
-    parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument("--episodes", type=int, default=1000)
+    parser.add_argument("--max-steps", type=int, default=2000)
     parser.add_argument("--planner", type=str, choices=("random", "cem"), default="cem")
     parser.add_argument("--num-sequences", type=int, default=2048)
     parser.add_argument("--horizon", type=int, default=10)
@@ -82,6 +92,8 @@ def print_model_size(model: NeuralCML, model_args: dict, obs_dim: int, action_di
         "Model size: "
         f"obs_dim={obs_dim}, action_dim={action_dim}, "
         f"latent_dim={model_args['latent_dim']}, hidden_dims={model_args['hidden_dims']}, "
+        f"network_type={model_args['network_type']}, snn_timesteps={model_args['snn_timesteps']}, "
+        f"snn_tau={model_args['snn_tau']}, snn_threshold={model_args['snn_threshold']}, "
         f"params={total_params:,}, trainable={trainable_params:,}, param_memory={param_mb:.3f} MB"
     )
 
@@ -101,6 +113,11 @@ def resolve_model_args(ckpt: dict) -> dict[str, object]:
     return {
         "latent_dim": int(saved_args.get("latent_dim", CML_LATENT_DIM)),
         "hidden_dims": resolve_hidden_dims(saved_args),
+        "network_type": saved_args.get("network_type", "mlp"),
+        "snn_timesteps": int(saved_args.get("snn_timesteps", CML_SNN_TIMESTEPS)),
+        "snn_tau": float(saved_args.get("snn_tau", CML_SNN_TAU)),
+        "snn_threshold": float(saved_args.get("snn_threshold", CML_SNN_THRESHOLD)),
+        "snn_surrogate_scale": float(saved_args.get("snn_surrogate_scale", CML_SNN_SURROGATE_SCALE)),
     }
 
 
@@ -113,6 +130,11 @@ def load_model(args: argparse.Namespace, obs_dim: int, action_dim: int, device: 
         action_dim=action_dim,
         latent_dim=model_args["latent_dim"],
         hidden_dims=model_args["hidden_dims"],
+        network_type=model_args["network_type"],
+        snn_timesteps=model_args["snn_timesteps"],
+        snn_tau=model_args["snn_tau"],
+        snn_threshold=model_args["snn_threshold"],
+        snn_surrogate_scale=model_args["snn_surrogate_scale"],
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()

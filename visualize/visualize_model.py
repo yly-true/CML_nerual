@@ -10,7 +10,15 @@ from matplotlib.animation import FuncAnimation
 import numpy as np
 import torch
 
-from cml.cml_model import CML_HIDDEN_DIMS, CML_LATENT_DIM, NeuralCML
+from cml.cml_model import (
+    CML_HIDDEN_DIMS,
+    CML_LATENT_DIM,
+    CML_SNN_SURROGATE_SCALE,
+    CML_SNN_TAU,
+    CML_SNN_THRESHOLD,
+    CML_SNN_TIMESTEPS,
+    NeuralCML,
+)
 from cml.tasks import CARTPOLE, PENDULUM, feature_dim, obs_to_features, resolve_env_id, resolve_task_name
 from cml.utils import get_dims, make_env, resolve_device
 
@@ -24,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--action-mode", choices=("random", "sine", "zero"), default="sine")
     parser.add_argument("--action-std", type=float, default=0.8)
-    parser.add_argument("--sine-amplitude", type=float, default=3)
+    parser.add_argument("--sine-amplitude", type=float, default=1)
     parser.add_argument("--sine-period", type=float, default=30.0)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--output", type=str, default=None, help="Optional .gif or .mp4 output path.")
@@ -61,12 +69,22 @@ def load_model(checkpoint: str, obs_dim: int, action_dim: int, device: torch.dev
     model_args = {
         "latent_dim": int(saved_args.get("latent_dim", CML_LATENT_DIM)),
         "hidden_dims": hidden_dims,
+        "network_type": saved_args.get("network_type", "mlp"),
+        "snn_timesteps": int(saved_args.get("snn_timesteps", CML_SNN_TIMESTEPS)),
+        "snn_tau": float(saved_args.get("snn_tau", CML_SNN_TAU)),
+        "snn_threshold": float(saved_args.get("snn_threshold", CML_SNN_THRESHOLD)),
+        "snn_surrogate_scale": float(saved_args.get("snn_surrogate_scale", CML_SNN_SURROGATE_SCALE)),
     }
     model = NeuralCML(
         obs_dim=obs_dim,
         action_dim=action_dim,
         latent_dim=model_args["latent_dim"],
         hidden_dims=model_args["hidden_dims"],
+        network_type=model_args["network_type"],
+        snn_timesteps=model_args["snn_timesteps"],
+        snn_tau=model_args["snn_tau"],
+        snn_threshold=model_args["snn_threshold"],
+        snn_surrogate_scale=model_args["snn_surrogate_scale"],
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()

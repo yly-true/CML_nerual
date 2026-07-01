@@ -19,7 +19,14 @@ import torch
 from torch import optim
 from tqdm import trange
 
-from cml.cml_model import NeuralCML
+from cml.cml_model import (
+    CML_NETWORK_TYPE,
+    CML_SNN_SURROGATE_SCALE,
+    CML_SNN_TAU,
+    CML_SNN_THRESHOLD,
+    CML_SNN_TIMESTEPS,
+    NeuralCML,
+)
 from cml.replay_buffer import ReplayBuffer
 from cml.tasks import feature_dim, obs_to_features, reset_train_env, resolve_env_id, resolve_task_name
 from cml.utils import (
@@ -48,6 +55,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recon-dim-weights", "--recon-weights", dest="recon_weights", type=float, nargs="*", default=None)
     parser.add_argument("--action-norm-weight", type=float, default=1e-4)
     parser.add_argument("--latent-norm-weight", type=float, default=1e-4)
+    parser.add_argument("--network-type", choices=("snn", "mlp"), default=CML_NETWORK_TYPE)
+    parser.add_argument("--snn-timesteps", type=int, default=CML_SNN_TIMESTEPS)
+    parser.add_argument("--snn-tau", type=float, default=CML_SNN_TAU)
+    parser.add_argument("--snn-threshold", type=float, default=CML_SNN_THRESHOLD)
+    parser.add_argument("--snn-surrogate-scale", type=float, default=CML_SNN_SURROGATE_SCALE)
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True, help="Use CUDA mixed precision training.")
     parser.add_argument("--save-every", type=int, default=5000)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--run-dir", type=str, default="runs")
@@ -99,10 +112,14 @@ def collect_random_data(
 
 def build_model(args: argparse.Namespace, obs_dim: int, action_dim: int, device: torch.device) -> NeuralCML:
     """按参数构造模型并放到目标设备上。"""
-    _ = args
     return NeuralCML(
         obs_dim=obs_dim,
         action_dim=action_dim,
+        network_type=args.network_type,
+        snn_timesteps=args.snn_timesteps,
+        snn_tau=args.snn_tau,
+        snn_threshold=args.snn_threshold,
+        snn_surrogate_scale=args.snn_surrogate_scale,
     ).to(device)
 
 
@@ -111,6 +128,11 @@ def model_config(model: NeuralCML) -> dict[str, object]:
     return {
         "latent_dim": model.latent_dim,
         "hidden_dims": list(model.hidden_dims),
+        "network_type": model.network_type,
+        "snn_timesteps": model.snn_timesteps,
+        "snn_tau": model.snn_tau,
+        "snn_threshold": model.snn_threshold,
+        "snn_surrogate_scale": model.snn_surrogate_scale,
     }
 
 
@@ -122,6 +144,8 @@ def print_model_size(model: NeuralCML, obs_dim: int, action_dim: int) -> None:
         "Model size: "
         f"obs_dim={obs_dim}, action_dim={action_dim}, "
         f"latent_dim={model.latent_dim}, hidden_dims={list(model.hidden_dims)}, "
+        f"network_type={model.network_type}, snn_timesteps={model.snn_timesteps}, "
+        f"snn_tau={model.snn_tau}, snn_threshold={model.snn_threshold}, "
         f"params={total_params:,}, param_memory={param_mb:.3f} MB"
     )
 
@@ -150,6 +174,19 @@ def checkpoint_update_index(checkpoint_path: Path | None) -> int:
     if match is None:
         return 0
     return int(match.group(1))
+
+
+def apply_checkpoint_model_args(args: argparse.Namespace, checkpoint_path: Path | None, device: torch.device) -> None:
+    """Use saved architecture args when continuing from a checkpoint."""
+    if checkpoint_path is None:
+        return
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    saved_args = ckpt.get("args", {})
+    args.network_type = saved_args.get("network_type", "mlp")
+    args.snn_timesteps = int(saved_args.get("snn_timesteps", CML_SNN_TIMESTEPS))
+    args.snn_tau = float(saved_args.get("snn_tau", CML_SNN_TAU))
+    args.snn_threshold = float(saved_args.get("snn_threshold", CML_SNN_THRESHOLD))
+    args.snn_surrogate_scale = float(saved_args.get("snn_surrogate_scale", CML_SNN_SURROGATE_SCALE))
 
 
 def load_model_checkpoint(
@@ -182,24 +219,30 @@ def train_model(
 ) -> None:
     """执行完整的自监督训练循环。"""
     recon_weights = build_recon_weights(args.recon_weights, model.obs_dim, device)
+    amp_enabled = bool(args.amp and device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    print(f"AMP mixed precision: {'enabled' if amp_enabled else 'disabled'}")
     pbar = trange(args.updates, desc="Training CML")  #带进度条的循环
     for local_step in pbar:
         update_idx = start_update + local_step + 1
         batch = buffer.sample(args.batch_size, device)  #从回放池里随机采样一个 batch
-        loss_out = model.loss(
-            batch.obs,
-            batch.actions,
-            batch.next_obs,
-            pred_weight=args.pred_weight,
-            recon_weight=args.recon_weight,
-            recon_weights=recon_weights,
-            action_norm_weight=args.action_norm_weight,
-            latent_norm_weight=args.latent_norm_weight,
-        )
+        with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
+            loss_out = model.loss(
+                batch.obs,
+                batch.actions,
+                batch.next_obs,
+                pred_weight=args.pred_weight,
+                recon_weight=args.recon_weight,
+                recon_weights=recon_weights,
+                action_norm_weight=args.action_norm_weight,
+                latent_norm_weight=args.latent_norm_weight,
+            )
         optimizer.zero_grad(set_to_none=True)
-        loss_out.total.backward()   #反向传播，计算梯度
+        scaler.scale(loss_out.total).backward()   #反向传播，计算梯度
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)  #梯度裁剪，防止梯度爆炸
-        optimizer.step()  #根据刚算出的梯度，真正修改参数
+        scaler.step(optimizer)  #根据刚算出的梯度，真正修改参数
+        scaler.update()
 
         if update_idx % 100 == 0:
             pred_loss = args.pred_weight * loss_out.pred.item()
@@ -261,6 +304,7 @@ def main() -> None:
     set_seed(args.seed)
     device = resolve_device(args.device)
     checkpoint_path = resolve_load_checkpoint(args.load_run)
+    apply_checkpoint_model_args(args, checkpoint_path, device)
 
     dataset = prepare_dataset(args)  #准备buffer并且填充buffer
     model = build_model(args, dataset.obs_dim, dataset.action_dim, device)
