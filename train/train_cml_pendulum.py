@@ -38,12 +38,13 @@ from cml.utils import (
 
 
 DEFAULT_CARTPOLE_RECON_WEIGHTS = [5.0, 1.0, 5.0, 5.0, 1.0]
+DEFAULT_BIPEDALWALKER_RECON_WEIGHTS = [2.0, 1.0, 3.0, 3.0] + [1.0] * 20
 
 
 def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(description="训练连续控制任务上的 Neural CML")
-    parser.add_argument("--task", choices=("pendulum", "cartpole"), default="cartpole")
+    parser.add_argument("--task", choices=("pendulum", "cartpole", "bipedalwalker"), default="cartpole")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--total-env-steps", type=int, default=300_000)
     parser.add_argument("--buffer-size", type=int, default=300_000)
@@ -53,6 +54,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pred-weight", type=float, default=1.0)  #0.01
     parser.add_argument("--recon-loss-weight", "--recon-weight", dest="recon_weight", type=float, default=1.0)
     parser.add_argument("--recon-dim-weights", "--recon-weights", dest="recon_weights", type=float, nargs="*", default=None)
+    parser.add_argument("--continuity-weight", type=float, default=0.2)
+    parser.add_argument("--continuity-dt", type=float, default=0.05)
     parser.add_argument("--action-norm-weight", type=float, default=1e-4)
     parser.add_argument("--latent-norm-weight", type=float, default=1e-4)
     parser.add_argument("--network-type", choices=("snn", "mlp"), default=CML_NETWORK_TYPE)
@@ -234,6 +237,8 @@ def train_model(
                 pred_weight=args.pred_weight,
                 recon_weight=args.recon_weight,
                 recon_weights=recon_weights,
+                continuity_weight=args.continuity_weight,
+                continuity_dt=args.continuity_dt,
                 action_norm_weight=args.action_norm_weight,
                 latent_norm_weight=args.latent_norm_weight,
             )
@@ -247,16 +252,19 @@ def train_model(
         if update_idx % 100 == 0:
             pred_loss = args.pred_weight * loss_out.pred.item()
             recon_loss = args.recon_weight * loss_out.recon.item()
+            continuity_loss = args.continuity_weight * loss_out.continuity.item()
             action_loss = args.action_norm_weight * loss_out.action_norm.item()
             latent_loss = args.latent_norm_weight * loss_out.latent_norm.item()
             pbar.set_postfix(
                 total=f"{loss_out.total.item():.4f}",
                 raw_pred=f"{loss_out.pred.item():.4e}",
                 raw_recon=f"{loss_out.recon.item():.4e}",
+                raw_continuity=f"{loss_out.continuity.item():.4e}",
                 raw_action_norm=f"{loss_out.action_norm.item():.4e}",
                 raw_latent_norm=f"{loss_out.latent_norm.item():.4e}",
                 weighted_pred=f"{pred_loss:.4e}",
                 weighted_recon=f"{recon_loss:.4e}",
+                weighted_continuity=f"{continuity_loss:.4e}",
                 weighted_action_norm=f"{action_loss:.4e}",
                 weighted_latent_norm=f"{latent_loss:.4e}",
             )
@@ -279,6 +287,8 @@ def prepare_dataset(args: argparse.Namespace):
     obs_dim = feature_dim(args.task, raw_obs_dim)
     if args.recon_weights is None and args.task == "cartpole":
         args.recon_weights = DEFAULT_CARTPOLE_RECON_WEIGHTS.copy()
+    if args.recon_weights is None and args.task == "bipedalwalker":
+        args.recon_weights = DEFAULT_BIPEDALWALKER_RECON_WEIGHTS.copy()
     buffer = ReplayBuffer(obs_dim, action_dim, args.buffer_size)
     collect_random_data(env, buffer, args.total_env_steps, args.seed, args)
 

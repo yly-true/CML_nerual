@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -30,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(description="评估连续控制任务上的 Neural CML")
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--task", choices=("pendulum", "cartpole"), default="pendulum")
+    parser.add_argument("--task", choices=("pendulum", "cartpole", "bipedalwalker"), default="pendulum")
     parser.add_argument("--episodes", type=int, default=1000)
     parser.add_argument("--max-steps", type=int, default=2000)
     parser.add_argument("--planner", type=str, choices=("random", "cem"), default="cem")
@@ -49,6 +50,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--target-angular-velocity", type=float, default=0.0)
     parser.add_argument("--target-cart-position", type=float, default=0.0)
+    parser.add_argument("--target-bipedalwalker-hull-angle", type=float, default=0.0)
+    parser.add_argument("--target-bipedalwalker-hull-angular-velocity", type=float, default=0.0)
+    parser.add_argument("--target-bipedalwalker-horizontal-velocity", type=float, default=1.0)
+    parser.add_argument("--target-bipedalwalker-vertical-velocity", type=float, default=0.0)
+    parser.add_argument("--initial-cart-position", type=float, default=None, help="CartPole initial x. Defaults to 0 when any CartPole initial option is set.")
+    parser.add_argument("--initial-cart-velocity", type=float, default=None, help="CartPole initial xdot. Defaults to 0 when any CartPole initial option is set.")
+    parser.add_argument("--initial-pole-angle", type=float, default=None, help="CartPole initial theta in radians. Defaults to 0 when any CartPole initial option is set.")
+    parser.add_argument("--initial-pole-angular-velocity", type=float, default=None, help="CartPole initial thetadot. Defaults to 0 when any CartPole initial option is set.")
+    parser.add_argument("--initial-pendulum-angle", type=float, default=None, help="Pendulum initial theta in radians. Defaults to env reset.")
+    parser.add_argument("--initial-pendulum-angular-velocity", type=float, default=0.0, help="Pendulum initial thetadot when --initial-pendulum-angle is set.")
     parser.add_argument(
         "--inference-mode",
         type=str,
@@ -123,7 +134,7 @@ def resolve_model_args(ckpt: dict) -> dict[str, object]:
 
 def load_model(args: argparse.Namespace, obs_dim: int, action_dim: int, device: torch.device):
     """从 checkpoint 恢复模型。"""
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    ckpt = torch_load_checkpoint(args.checkpoint, device)
     model_args = resolve_model_args(ckpt)
     model = NeuralCML(
         obs_dim=obs_dim,
@@ -140,6 +151,14 @@ def load_model(args: argparse.Namespace, obs_dim: int, action_dim: int, device: 
     model.eval()
     print_model_size(model, model_args, obs_dim, action_dim)
     return model
+
+
+def torch_load_checkpoint(checkpoint_path: str, device: torch.device):
+    """Load checkpoints on both new and older PyTorch versions."""
+    try:
+        return torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(checkpoint_path, map_location=device)
 
 
 def prepare_planner_inputs(
@@ -252,8 +271,55 @@ class TerminalKeyListener:
 def reset_env_to_initial_state(task_name: str, env, args: argparse.Namespace) -> np.ndarray:
     """Reset environment and render/log the initial state."""
     obs = reset_eval_env(task_name, env)
+    obs = apply_requested_initial_state(task_name, env, obs, args)
     print(format_obs(task_name, "reset_obs", obs))
     maybe_render(env, args)
+    return obs
+
+
+def apply_requested_initial_state(task_name: str, env, obs: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+    """Override the reset state when an explicit initial condition is provided."""
+    sim = env.unwrapped
+    cartpole_initial_values = (
+        args.initial_cart_position,
+        args.initial_cart_velocity,
+        args.initial_pole_angle,
+        args.initial_pole_angular_velocity,
+    )
+    if task_name == "cartpole" and any(value is not None for value in cartpole_initial_values):
+        cart_position = 0.0 if args.initial_cart_position is None else args.initial_cart_position
+        pole_angle = 0.0 if args.initial_pole_angle is None else args.initial_pole_angle
+        cart_velocity = 0.0 if args.initial_cart_velocity is None else args.initial_cart_velocity
+        pole_angular_velocity = 0.0 if args.initial_pole_angular_velocity is None else args.initial_pole_angular_velocity
+        sim.state = np.asarray(
+            [
+                cart_position,
+                pole_angle,
+                cart_velocity,
+                pole_angular_velocity,
+            ],
+            dtype=np.float32,
+        )
+        if hasattr(sim, "steps"):
+            sim.steps = 0
+        return sim.state.copy()
+
+    if task_name == "pendulum" and args.initial_pendulum_angle is not None:
+        sim.state = np.asarray(
+            [args.initial_pendulum_angle, args.initial_pendulum_angular_velocity],
+            dtype=np.float32,
+        )
+        if hasattr(sim, "_get_obs"):
+            return np.asarray(sim._get_obs(), dtype=np.float32)
+        return np.asarray(
+            [
+                math.cos(args.initial_pendulum_angle),
+                math.sin(args.initial_pendulum_angle),
+                args.initial_pendulum_angular_velocity,
+            ],
+            dtype=np.float32,
+        )
+
     return obs
 
 

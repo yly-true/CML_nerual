@@ -20,6 +20,7 @@ obs_next = decoder(s_next)
 ```text
 pendulum: Pendulum-v1
 cartpole: 连续力输入的经典小车-单杆倒立摆
+bipedalwalker: BipedalWalker-v3
 ```
 
 观测特征：
@@ -27,6 +28,7 @@ cartpole: 连续力输入的经典小车-单杆倒立摆
 ```text
 pendulum: [cos(theta), sin(theta), thetadot]
 cartpole: [x, xdot, cos(theta), sin(theta), thetadot]
+bipedalwalker: Gymnasium 原始 24 维观测
 ```
 
 ## 安装
@@ -52,6 +54,7 @@ runs\       checkpoint 和可视化结果，可提交到 git
 ```powershell
 python -m train.train_cml_pendulum --task pendulum --device cuda
 python -m train.train_cml_pendulum --task cartpole --device cuda
+python -m train.train_cml_pendulum --task bipedalwalker --device cuda
 ```
 
 可以给 reconstruction loss 指定逐维权重：
@@ -92,6 +95,9 @@ python -m evaluate.evaluate --task pendulum --checkpoint "$ckpt" --episodes 3 --
 
 $ckpt = Get-ChildItem runs\ContinuousCartPole_v0 -Recurse -Filter model_100000.pt | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
 python -m evaluate.evaluate --task cartpole --checkpoint "$ckpt" --episodes 3 --device cuda --render
+
+$ckpt = Get-ChildItem runs\BipedalWalker_v3 -Recurse -Filter model_100000.pt | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+python -m evaluate.evaluate --task bipedalwalker --checkpoint "$ckpt" --episodes 3 --device cuda --render
 ```
 
 评估使用 MPC：每一步用模型预测未来 `horizon` 步，选择最优动作序列，只执行第一个动作。
@@ -130,21 +136,21 @@ python -m visualize.visualize_model --task cartpole --checkpoint "$ckpt" --outpu
 在 `cml\cml_model.py` 顶部修改：
 
 ```python
-CML_LATENT_DIM = 512
-CML_HIDDEN_DIMS = [16, 64, 64]
-CML_NETWORK_TYPE = "snn"
+CML_LATENT_DIM = 16
+CML_HIDDEN_DIMS = [64, 64]
+CML_NETWORK_TYPE = "mlp"
 CML_SNN_TIMESTEPS = 16
 CML_SNN_TAU = 2.0
 CML_SNN_THRESHOLD = 0.5
 ```
 
 `CML_HIDDEN_DIMS` 中每个数字对应一层隐藏层宽度。
-默认网络为 SNN：每个隐藏层使用 `Linear -> LIF spike`，输出层使用线性读出并对时间步求平均。
-当前默认配置为 `latent_dim=32`、`hidden_dims=[128, 128]`、`snn_timesteps=16`、`threshold=0.5`。
-训练时也可以通过命令行临时切回 MLP：
+当前默认配置为 `latent_dim=16`、`hidden_dims=[64, 64]`、`network_type=mlp`。
+MLP 每个隐藏层使用 `Linear -> ReLU`，输出层为 Linear。
+训练时也可以通过命令行临时切到 SNN：
 
 ```powershell
-python -m train.train_cml_pendulum --task cartpole --network-type mlp --device cuda
+python -m train.train_cml_pendulum --task cartpole --network-type snn --device cuda
 ```
 
 CUDA 训练默认开启 AMP 混合精度以加速；如需关闭：
@@ -152,3 +158,5 @@ CUDA 训练默认开启 AMP 混合精度以加速；如需关闭：
 ```powershell
 python -m train.train_cml_pendulum --task cartpole --device cuda --no-amp
 ```
+
+CartPole 训练默认加入 kinematic continuity loss，约束 `x` 和杆角度按当前速度连续演化，减少模型预测里的位置闪跳。可通过 `--continuity-weight` 调整，设为 `0` 可关闭。

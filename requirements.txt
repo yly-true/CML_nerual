@@ -1,6 +1,6 @@
 torch>=2.1
 numpy>=1.24
-gymnasium[classic-control]>=0.29
+gymnasium[classic-control,box2d]>=0.29
 tqdm>=4.66
 matplotlib>=3.7
 pillow>=10.0

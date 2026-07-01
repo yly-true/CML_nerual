@@ -9,9 +9,9 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-CML_LATENT_DIM = 32
-CML_HIDDEN_DIMS = [128, 128]
-CML_NETWORK_TYPE = "snn"
+CML_LATENT_DIM = 16
+CML_HIDDEN_DIMS = [64, 64]
+CML_NETWORK_TYPE = "mlp"
 CML_SNN_TIMESTEPS = 16
 CML_SNN_TAU = 2.0
 CML_SNN_THRESHOLD = 0.5
@@ -158,6 +158,7 @@ class CMLLossOutput:
     total: torch.Tensor
     pred: torch.Tensor
     recon: torch.Tensor
+    continuity: torch.Tensor
     action_norm: torch.Tensor
     latent_norm: torch.Tensor
 
@@ -263,6 +264,8 @@ class NeuralCML(nn.Module):
         pred_weight: float = 1.0,
         recon_weight: float = 0.05,
         recon_weights: torch.Tensor | None = None,
+        continuity_weight: float = 0.0,
+        continuity_dt: float = 0.05,
         action_norm_weight: float = 1e-4,
         latent_norm_weight: float = 1e-4,
     ) -> CMLLossOutput:
@@ -284,6 +287,7 @@ class NeuralCML(nn.Module):
         obs_hat = self.decode(state)
         next_obs_hat = self.decode(next_state_hat)
         recon = 0.5 * weighted_mse(obs_hat, obs, recon_weights) + 0.5 * weighted_mse(next_obs_hat, next_obs, recon_weights)
+        continuity = cartpole_continuity_loss(obs, next_obs_hat, continuity_dt) if continuity_weight > 0.0 else pred.new_zeros(())
 
         # 正则项约束 latent 几何不要过度发散。
         action_delta = self.action_delta(state, action)
@@ -293,10 +297,11 @@ class NeuralCML(nn.Module):
         total = (
             pred_weight * pred
             + recon_weight * recon
+            + continuity_weight * continuity
             + action_norm_weight * action_norm
             + latent_norm_weight * latent_norm
         )
-        return CMLLossOutput(total, pred, recon, action_norm, latent_norm)
+        return CMLLossOutput(total, pred, recon, continuity, action_norm, latent_norm)
 
 
 def weighted_mse(pred: torch.Tensor, target: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
@@ -305,6 +310,27 @@ def weighted_mse(pred: torch.Tensor, target: torch.Tensor, weights: torch.Tensor
     if weights is not None:
         err = err * weights.to(device=pred.device, dtype=pred.dtype).view(1, -1)
     return err.mean()
+
+
+def cartpole_continuity_loss(obs: torch.Tensor, next_obs_hat: torch.Tensor, dt: float = 0.05) -> torch.Tensor:
+    """Kinematic continuity prior for cartpole features.
+
+    Feature order is [x, xdot, cos(theta), sin(theta), thetadot].
+    The force affects acceleration, but x and theta should still advance
+    smoothly from the current velocities over one environment step.
+    """
+    if obs.shape[-1] != 5 or next_obs_hat.shape[-1] != 5:
+        return next_obs_hat.new_zeros(())
+
+    x_target = obs[..., 0] + dt * obs[..., 1]
+    theta = torch.atan2(obs[..., 3], obs[..., 2])
+    theta_target = theta + dt * obs[..., 4]
+    cos_target = torch.cos(theta_target)
+    sin_target = torch.sin(theta_target)
+
+    x_loss = F.mse_loss(next_obs_hat[..., 0], x_target)
+    angle_loss = 0.5 * F.mse_loss(next_obs_hat[..., 2], cos_target) + 0.5 * F.mse_loss(next_obs_hat[..., 3], sin_target)
+    return x_loss + angle_loss
 
 
 @torch.no_grad()

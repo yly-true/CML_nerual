@@ -12,10 +12,12 @@ from gymnasium import spaces
 
 PENDULUM = "pendulum"
 CARTPOLE = "cartpole"
+BIPEDALWALKER = "bipedalwalker"
 
 TASK_ENV_IDS = {
     PENDULUM: "Pendulum-v1",
     CARTPOLE: "ContinuousCartPole-v0",
+    BIPEDALWALKER: "BipedalWalker-v3",
 }
 
 
@@ -34,14 +36,27 @@ def feature_names(task_name: str) -> list[str]:
         return ["cos(theta)", "sin(theta)", "thetadot"]
     if task_name == CARTPOLE:
         return ["x", "xdot", "cos(theta)", "sin(theta)", "thetadot"]
+    if task_name == BIPEDALWALKER:
+        return [f"obs_{idx}" for idx in range(24)]
     raise ValueError(f"Unsupported task: {task_name}")
 
 
 def feature_dim(task_name: str, raw_obs_dim: int) -> int:
-    expected_raw_dim = 3 if task_name == PENDULUM else 4
+    expected_raw_dim_by_task = {
+        PENDULUM: 3,
+        CARTPOLE: 4,
+        BIPEDALWALKER: 24,
+    }
+    expected_raw_dim = expected_raw_dim_by_task[task_name]
     if raw_obs_dim < expected_raw_dim:
         raise ValueError(f"{task_name} expects raw obs dim >= {expected_raw_dim}, got {raw_obs_dim}.")
-    return 3 if task_name == PENDULUM else 5
+    if task_name == PENDULUM:
+        return 3
+    if task_name == CARTPOLE:
+        return 5
+    if task_name == BIPEDALWALKER:
+        return 24
+    raise ValueError(f"Unsupported task: {task_name}")
 
 
 def obs_to_features(task_name: str, obs) -> np.ndarray:
@@ -56,6 +71,8 @@ def obs_to_features(task_name: str, obs) -> np.ndarray:
         features[..., 3] = np.sin(obs_arr[..., 1])
         features[..., 4] = obs_arr[..., 3]
         return features
+    if task_name == BIPEDALWALKER:
+        return obs_arr
     raise ValueError(f"Unsupported task: {task_name}")
 
 
@@ -64,6 +81,13 @@ def target_features(task_name: str, args: argparse.Namespace) -> np.ndarray:
         return np.asarray([1.0, 0.0, args.target_angular_velocity], dtype=np.float32)
     if task_name == CARTPOLE:
         return np.asarray([args.target_cart_position, 0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    if task_name == BIPEDALWALKER:
+        target = np.zeros(24, dtype=np.float32)
+        target[0] = args.target_bipedalwalker_hull_angle
+        target[1] = args.target_bipedalwalker_hull_angular_velocity
+        target[2] = args.target_bipedalwalker_horizontal_velocity
+        target[3] = args.target_bipedalwalker_vertical_velocity
+        return target
     raise ValueError(f"Unsupported task: {task_name}")
 
 
@@ -72,6 +96,8 @@ def reset_train_env(task_name: str, env, args: argparse.Namespace, seed: int | N
         return reset_pendulum_train(env, args, seed=seed)
     if task_name == CARTPOLE:
         return reset_cartpole_train(env, args, seed=seed)
+    if task_name == BIPEDALWALKER:
+        return reset_bipedalwalker_train(env, args, seed=seed)
     raise ValueError(f"Unsupported task: {task_name}")
 
 
@@ -110,6 +136,16 @@ def reset_cartpole_train(env, args: argparse.Namespace, seed: int | None = None)
     return current_obs(CARTPOLE, env)
 
 
+def reset_bipedalwalker_train(env, args: argparse.Namespace, seed: int | None = None) -> np.ndarray:
+    """Reset BipedalWalker with its default randomized initial state."""
+    _ = args
+    if seed is None:
+        obs, _ = env.reset()
+    else:
+        obs, _ = env.reset(seed=seed)
+    return np.asarray(obs, dtype=np.float32)
+
+
 def reset_eval_env(task_name: str, env) -> np.ndarray:
     obs, _ = env.reset()
     return np.asarray(obs, dtype=np.float32)
@@ -146,6 +182,14 @@ def format_obs(task_name: str, prefix: str, obs: np.ndarray) -> str:
             f"theta={obs_arr[1]:.4f}, "
             f"xdot={obs_arr[2]:.4f}, "
             f"thetadot={obs_arr[3]:.4f}"
+        )
+    if task_name == BIPEDALWALKER:
+        return (
+            f"{prefix}: "
+            f"hull_angle={obs_arr[0]:.4f}, "
+            f"hull_angular_velocity={obs_arr[1]:.4f}, "
+            f"horizontal_velocity={obs_arr[2]:.4f}, "
+            f"vertical_velocity={obs_arr[3]:.4f}"
         )
     raise ValueError(f"Unsupported task: {task_name}")
 
