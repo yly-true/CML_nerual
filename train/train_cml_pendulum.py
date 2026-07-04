@@ -20,6 +20,8 @@ from torch import optim
 from tqdm import trange
 
 from cml.cml_model import (
+    CML_DERIVATIVE_DT,
+    CML_DYNAMICS_MODE,
     CML_NETWORK_TYPE,
     CML_SNN_SURROGATE_SCALE,
     CML_SNN_TAU,
@@ -28,7 +30,7 @@ from cml.cml_model import (
     NeuralCML,
 )
 from cml.replay_buffer import ReplayBuffer
-from cml.tasks import feature_dim, obs_to_features, reset_train_env, resolve_env_id, resolve_task_name
+from cml.tasks import feature_dim, obs_to_features_from_env, reset_train_env, resolve_env_id, resolve_task_name
 from cml.utils import (
     get_dims,
     make_env,
@@ -38,13 +40,14 @@ from cml.utils import (
 
 
 DEFAULT_CARTPOLE_RECON_WEIGHTS = [5.0, 1.0, 5.0, 5.0, 1.0]
-DEFAULT_BIPEDALWALKER_RECON_WEIGHTS = [2.0, 1.0, 3.0, 3.0] + [1.0] * 10
+DEFAULT_BIPEDALWALKER_RECON_WEIGHTS = [15.0, 15.0, 15.0, 15.0, 15.0] + [15.0] * 8
+DEFAULT_MECANUM_RECON_WEIGHTS = [10.0, 10.0, 10.0] + [2.0] * 4
 
 
 def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(description="训练连续控制任务上的 Neural CML")
-    parser.add_argument("--task", choices=("pendulum", "cartpole", "bipedalwalker"), default="cartpole")
+    parser.add_argument("--task", choices=("pendulum", "cartpole", "bipedalwalker", "mecanum"), default="cartpole")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--total-env-steps", type=int, default=300_000)
     parser.add_argument("--buffer-size", type=int, default=300_000)
@@ -59,6 +62,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-norm-weight", type=float, default=1e-4)
     parser.add_argument("--latent-norm-weight", type=float, default=1e-4)
     parser.add_argument("--network-type", choices=("snn", "mlp"), default=CML_NETWORK_TYPE)
+    parser.add_argument("--dynamics-mode", choices=("auto", "latent", "obs_derivative"), default="auto")
+    parser.add_argument("--derivative-dt", type=float, default=CML_DERIVATIVE_DT)
     parser.add_argument("--snn-timesteps", type=int, default=CML_SNN_TIMESTEPS)
     parser.add_argument("--snn-tau", type=float, default=CML_SNN_TAU)
     parser.add_argument("--snn-threshold", type=float, default=CML_SNN_THRESHOLD)
@@ -92,20 +97,46 @@ def collect_random_data(
     gaussian_mean = np.zeros_like(action_low, dtype=np.float32)
     gaussian_std = np.maximum((action_high - action_low) / 8.0, 1e-6)
     gaussian_prob = 0.5
+    mecanum_action_primitives = np.asarray(
+        [
+            [0.5, 0.5, 0.5, 0.5],
+            [-0.5, -0.5, -0.5, -0.5],
+            [0.5, -0.5, -0.5, 0.5],
+            [-0.5, 0.5, 0.5, -0.5],
+            [0.5, -0.5, 0.5, -0.5],
+            [-0.5, 0.5, -0.5, 0.5],
+            [0.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    segment_action = np.zeros_like(action_low, dtype=np.float32)
+    segment_remaining = 0
 
     obs = reset_train_env(args.task, env, args, seed=seed)
     for _ in trange(steps, desc="Collecting random transitions"):
-        if np.random.rand() < gaussian_prob:
+        if args.task == "mecanum":
+            if segment_remaining <= 0:
+                segment_remaining = int(np.random.randint(40, 161))
+                if np.random.rand() < 0.75:
+                    primitive = mecanum_action_primitives[np.random.randint(len(mecanum_action_primitives))]
+                    segment_action = primitive[: action_low.size].copy()
+                else:
+                    segment_action = np.random.uniform(action_low, action_high).astype(np.float32)
+            action = np.clip(segment_action, action_low, action_high).astype(np.float32)
+            segment_remaining -= 1
+        elif np.random.rand() < gaussian_prob:
             action = np.random.normal(loc=gaussian_mean, scale=gaussian_std).astype(np.float32)
             action = np.clip(action, action_low, action_high)
         else:
             action = np.random.uniform(action_low, action_high).astype(np.float32)
+        obs_features = obs_to_features_from_env(args.task, obs, env)
         next_obs, _, terminated, truncated, _ = env.step(action)
+        next_obs_features = obs_to_features_from_env(args.task, next_obs, env)
         done = terminated or truncated
         buffer.add(
-            obs_to_features(args.task, obs),
+            obs_features,
             action,
-            obs_to_features(args.task, next_obs),
+            next_obs_features,
             done,
         )
         obs = next_obs
@@ -115,10 +146,17 @@ def collect_random_data(
 
 def build_model(args: argparse.Namespace, obs_dim: int, action_dim: int, device: torch.device) -> NeuralCML:
     """按参数构造模型并放到目标设备上。"""
+    dynamics_mode = args.dynamics_mode
+    if dynamics_mode == "auto":
+        dynamics_mode = "obs_derivative" if args.task == "mecanum" else CML_DYNAMICS_MODE
+    derivative_dim = obs_dim
     return NeuralCML(
         obs_dim=obs_dim,
         action_dim=action_dim,
         network_type=args.network_type,
+        dynamics_mode=dynamics_mode,
+        derivative_dt=args.derivative_dt,
+        derivative_dim=derivative_dim,
         snn_timesteps=args.snn_timesteps,
         snn_tau=args.snn_tau,
         snn_threshold=args.snn_threshold,
@@ -132,6 +170,9 @@ def model_config(model: NeuralCML) -> dict[str, object]:
         "latent_dim": model.latent_dim,
         "hidden_dims": list(model.hidden_dims),
         "network_type": model.network_type,
+        "dynamics_mode": model.dynamics_mode,
+        "derivative_dt": model.derivative_dt,
+        "derivative_dim": model.derivative_dim,
         "snn_timesteps": model.snn_timesteps,
         "snn_tau": model.snn_tau,
         "snn_threshold": model.snn_threshold,
@@ -147,7 +188,9 @@ def print_model_size(model: NeuralCML, obs_dim: int, action_dim: int) -> None:
         "Model size: "
         f"obs_dim={obs_dim}, action_dim={action_dim}, "
         f"latent_dim={model.latent_dim}, hidden_dims={list(model.hidden_dims)}, "
-        f"network_type={model.network_type}, snn_timesteps={model.snn_timesteps}, "
+        f"network_type={model.network_type}, dynamics_mode={model.dynamics_mode}, "
+        f"derivative_dt={model.derivative_dt}, derivative_dim={model.derivative_dim}, "
+        f"snn_timesteps={model.snn_timesteps}, "
         f"snn_tau={model.snn_tau}, snn_threshold={model.snn_threshold}, "
         f"params={total_params:,}, param_memory={param_mb:.3f} MB"
     )
@@ -186,6 +229,8 @@ def apply_checkpoint_model_args(args: argparse.Namespace, checkpoint_path: Path 
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     saved_args = ckpt.get("args", {})
     args.network_type = saved_args.get("network_type", "mlp")
+    args.dynamics_mode = saved_args.get("dynamics_mode", "latent")
+    args.derivative_dt = float(saved_args.get("derivative_dt", CML_DERIVATIVE_DT))
     args.snn_timesteps = int(saved_args.get("snn_timesteps", CML_SNN_TIMESTEPS))
     args.snn_tau = float(saved_args.get("snn_tau", CML_SNN_TAU))
     args.snn_threshold = float(saved_args.get("snn_threshold", CML_SNN_THRESHOLD))
@@ -250,24 +295,20 @@ def train_model(
         scaler.update()
 
         if update_idx % 100 == 0:
-            pred_loss = args.pred_weight * loss_out.pred.item()
-            recon_loss = args.recon_weight * loss_out.recon.item()
-            continuity_loss = args.continuity_weight * loss_out.continuity.item()
-            action_loss = args.action_norm_weight * loss_out.action_norm.item()
-            latent_loss = args.latent_norm_weight * loss_out.latent_norm.item()
-            pbar.set_postfix(
+            postfix = dict(
                 total=f"{loss_out.total.item():.4f}",
-                raw_pred=f"{loss_out.pred.item():.4e}",
-                raw_recon=f"{loss_out.recon.item():.4e}",
-                raw_continuity=f"{loss_out.continuity.item():.4e}",
-                raw_action_norm=f"{loss_out.action_norm.item():.4e}",
-                raw_latent_norm=f"{loss_out.latent_norm.item():.4e}",
-                weighted_pred=f"{pred_loss:.4e}",
-                weighted_recon=f"{recon_loss:.4e}",
-                weighted_continuity=f"{continuity_loss:.4e}",
-                weighted_action_norm=f"{action_loss:.4e}",
-                weighted_latent_norm=f"{latent_loss:.4e}",
+                act_reg=f"{loss_out.action_norm.item():.3e}",
+                state_reg=f"{loss_out.latent_norm.item():.3e}",
             )
+            if getattr(model, "dynamics_mode", "latent") == "obs_derivative":
+                postfix["step"] = f"{loss_out.pred.item():.3e}"
+                postfix["s_dot"] = f"{loss_out.dot.item():.3e}"
+            else:
+                postfix["pred"] = f"{loss_out.pred.item():.3e}"
+                postfix["recon"] = f"{loss_out.recon.item():.3e}"
+            if loss_out.continuity.item() != 0.0:
+                postfix["cont"] = f"{loss_out.continuity.item():.3e}"
+            pbar.set_postfix(**postfix)
 
         if update_idx % args.save_every == 0 or local_step + 1 == args.updates:
             save_checkpoint(
@@ -289,6 +330,8 @@ def prepare_dataset(args: argparse.Namespace):
         args.recon_weights = DEFAULT_CARTPOLE_RECON_WEIGHTS.copy()
     if args.recon_weights is None and args.task == "bipedalwalker":
         args.recon_weights = DEFAULT_BIPEDALWALKER_RECON_WEIGHTS.copy()
+    if args.recon_weights is None and args.task == "mecanum":
+        args.recon_weights = DEFAULT_MECANUM_RECON_WEIGHTS.copy()
     buffer = ReplayBuffer(obs_dim, action_dim, args.buffer_size)
     collect_random_data(env, buffer, args.total_env_steps, args.seed, args)
 

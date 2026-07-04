@@ -1,0 +1,43 @@
+{
+  "task": "mecanum",
+  "seed": 0,
+  "total_env_steps": 300000,
+  "buffer_size": 300000,
+  "updates": 100000,
+  "batch_size": 256,
+  "lr": 0.0003,
+  "pred_weight": 1.0,
+  "recon_weight": 2.0,
+  "recon_weights": [
+    10.0,
+    10.0,
+    10.0,
+    2.0,
+    2.0,
+    2.0,
+    2.0
+  ],
+  "continuity_weight": 0.2,
+  "continuity_dt": 0.05,
+  "action_norm_weight": 0.0001,
+  "latent_norm_weight": 0.0001,
+  "network_type": "mlp",
+  "dynamics_mode": "obs_derivative",
+  "derivative_dt": 0.02,
+  "snn_timesteps": 16,
+  "snn_tau": 2.0,
+  "snn_threshold": 0.5,
+  "snn_surrogate_scale": 10.0,
+  "amp": true,
+  "save_every": 5000,
+  "device": "cuda",
+  "run_dir": "runs",
+  "load_run": null,
+  "env_id": "MecanumDrive-v0",
+  "latent_dim": 7,
+  "hidden_dims": [
+    128,
+    128
+  ],
+  "derivative_dim": 7
+}

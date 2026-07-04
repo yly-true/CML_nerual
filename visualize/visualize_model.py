@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import time
 
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
@@ -11,6 +12,8 @@ import numpy as np
 import torch
 
 from cml.cml_model import (
+    CML_DERIVATIVE_DT,
+    CML_DYNAMICS_MODE,
     CML_HIDDEN_DIMS,
     CML_LATENT_DIM,
     CML_SNN_SURROGATE_SCALE,
@@ -19,18 +22,43 @@ from cml.cml_model import (
     CML_SNN_TIMESTEPS,
     NeuralCML,
 )
-from cml.tasks import BIPEDALWALKER, CARTPOLE, PENDULUM, feature_dim, obs_to_features, resolve_env_id, resolve_task_name
+from cml.tasks import (
+    BIPEDALWALKER,
+    CARTPOLE,
+    MECANUM,
+    PENDULUM,
+    feature_dim,
+    feature_names,
+    obs_to_features,
+    obs_to_features_from_env,
+    resolve_env_id,
+    resolve_task_name,
+)
 from cml.utils import get_dims, make_env, resolve_device
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="可视化 Pendulum-v1 Neural CML 虚拟仿真器")
     parser.add_argument("--checkpoint", type=str, default=None, help="默认自动使用 runs 里的最新 checkpoint。")
-    parser.add_argument("--task", choices=("pendulum", "cartpole", "bipedalwalker"), default="pendulum")
-    parser.add_argument("--steps", type=int, default=80)
+    parser.add_argument("--task", choices=("pendulum", "cartpole", "bipedalwalker", "mecanum"), default="pendulum")
+    parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--action-mode", choices=("random", "sine", "zero"), default="sine")
+    parser.add_argument("--action-mode", choices=("constant", "random", "sine", "zero"), default="constant")
+    parser.add_argument(
+        "--constant-action",
+        type=float,
+        nargs="*",
+        default=[0.5],
+        help="Constant action value. Provide one value or one per action dimension.",
+    )
+    parser.add_argument(
+        "--constant-torque",
+        type=float,
+        nargs="*",
+        default=None,
+        help="Mecanum-only constant motor torque. Provide one value or one per wheel; converted by ctrl_scale.",
+    )
     parser.add_argument("--action-std", type=float, default=0.8)
     parser.add_argument("--sine-amplitude", type=float, default=1)
     parser.add_argument("--sine-period", type=float, default=30.0)
@@ -70,6 +98,9 @@ def load_model(checkpoint: str, obs_dim: int, action_dim: int, device: torch.dev
         "latent_dim": int(saved_args.get("latent_dim", CML_LATENT_DIM)),
         "hidden_dims": hidden_dims,
         "network_type": saved_args.get("network_type", "mlp"),
+        "dynamics_mode": saved_args.get("dynamics_mode", CML_DYNAMICS_MODE),
+        "derivative_dt": float(saved_args.get("derivative_dt", CML_DERIVATIVE_DT)),
+        "derivative_dim": int(saved_args.get("derivative_dim", obs_dim)),
         "snn_timesteps": int(saved_args.get("snn_timesteps", CML_SNN_TIMESTEPS)),
         "snn_tau": float(saved_args.get("snn_tau", CML_SNN_TAU)),
         "snn_threshold": float(saved_args.get("snn_threshold", CML_SNN_THRESHOLD)),
@@ -81,6 +112,9 @@ def load_model(checkpoint: str, obs_dim: int, action_dim: int, device: torch.dev
         latent_dim=model_args["latent_dim"],
         hidden_dims=model_args["hidden_dims"],
         network_type=model_args["network_type"],
+        dynamics_mode=model_args["dynamics_mode"],
+        derivative_dt=model_args["derivative_dt"],
+        derivative_dim=model_args["derivative_dim"],
         snn_timesteps=model_args["snn_timesteps"],
         snn_tau=model_args["snn_tau"],
         snn_threshold=model_args["snn_threshold"],
@@ -100,10 +134,27 @@ def generate_actions(args: argparse.Namespace, env) -> np.ndarray:
     if args.action_mode == "zero":
         return actions
 
+    if args.action_mode == "constant":
+        constant_values = args.constant_action
+        if args.constant_torque is not None:
+            ctrl_scale = float(getattr(env.unwrapped, "ctrl_scale", 1.0))
+            constant_values = [float(value) / ctrl_scale for value in args.constant_torque]
+        if len(constant_values) == 0:
+            raise ValueError("--constant-action requires at least one value.")
+        if len(constant_values) == 1:
+            constant_action = np.full(action_low.shape, constant_values[0], dtype=np.float32)
+        elif len(constant_values) == action_low.size:
+            constant_action = np.asarray(constant_values, dtype=np.float32)
+        else:
+            raise ValueError(f"--constant-action must contain 1 or {action_low.size} values.")
+        actions[:, :] = constant_action
+        return np.clip(actions, action_low, action_high)
+
     if args.action_mode == "sine":
         t = np.arange(args.steps, dtype=np.float32)
-        wave = args.sine_amplitude * np.sin(2.0 * np.pi * t / args.sine_period)
-        actions[:, 0] = wave
+        phase = np.linspace(0.0, 2.0 * np.pi, action_low.size, endpoint=False, dtype=np.float32)
+        wave = args.sine_amplitude * np.sin(2.0 * np.pi * t[:, None] / args.sine_period + phase[None, :])
+        actions[:, :] = wave
         return np.clip(actions, action_low, action_high)
 
     actions = rng.normal(loc=0.0, scale=args.action_std, size=actions.shape).astype(np.float32)
@@ -123,6 +174,9 @@ def reset_visual_env_down(task_name: str, env, seed: int) -> np.ndarray:
     if task_name == BIPEDALWALKER:
         obs, _ = env.reset(seed=seed)
         return np.asarray(obs, dtype=np.float32)
+    if task_name == MECANUM:
+        obs, _ = env.reset(seed=seed)
+        return np.asarray(obs, dtype=np.float32)
     raise ValueError(f"Unsupported task: {task_name}")
 
 
@@ -136,31 +190,69 @@ def predict_next_obs(
     obs_t = torch.as_tensor(obs.astype(np.float32), dtype=torch.float32, device=device).view(1, -1)
     action_t = torch.as_tensor(action, dtype=torch.float32, device=device).view(1, -1)
     state = model.encode(obs_t)
-    next_state = model.transition(state, action_t)
+    next_state = model.transition(state, action_t, obs_t)
     return model.decode(next_state).detach().cpu().numpy()[0].astype(np.float32)
+
+
+@torch.no_grad()
+def predict_obs_derivative(
+    model: NeuralCML,
+    obs: np.ndarray,
+    action: np.ndarray,
+    device: torch.device,
+) -> np.ndarray | None:
+    if getattr(model, "dynamics_mode", "latent") != "obs_derivative":
+        return None
+    obs_t = torch.as_tensor(obs.astype(np.float32), dtype=torch.float32, device=device).view(1, -1)
+    action_t = torch.as_tensor(action, dtype=torch.float32, device=device).view(1, -1)
+    return model.obs_derivative(obs_t, action_t).detach().cpu().numpy()[0].astype(np.float32)
 
 
 def rollout(args: argparse.Namespace, model: NeuralCML, device: torch.device):
     task_name = resolve_task_name(args.task)
-    env = make_env(resolve_env_id(task_name))
+    render_mode = "human" if task_name == MECANUM and args.show else None
+    env = make_env(resolve_env_id(task_name), render_mode=render_mode)
     _, action_dim = get_dims(env)
     actions = generate_actions(args, env)
 
     real_obs = reset_visual_env_down(task_name, env, args.seed)
-    real_traj = [real_obs]
-    model_traj = [obs_to_features(task_name, real_obs)]
+    initial_features = obs_to_features_from_env(task_name, real_obs, env)
+    use_feature_traj = task_name in (BIPEDALWALKER, MECANUM)
+    real_traj = [initial_features if use_feature_traj else real_obs]
+    model_traj = [initial_features]
+    step_errors = [0.0]
+    s_dot_errors = [np.nan]
     for action in actions:
-        current_features = obs_to_features(task_name, real_obs)
+        current_features = obs_to_features_from_env(task_name, real_obs, env)
         predicted_next_features = predict_next_obs(model, current_features, action, device)
+        predicted_s_dot = predict_obs_derivative(model, current_features, action, device)
         real_obs, _, terminated, truncated, _ = env.step(action)
-        real_traj.append(np.asarray(real_obs, dtype=np.float32))
+        if task_name == MECANUM and args.show:
+            env.render()
+            time.sleep(1.0 / max(args.fps, 1))
+        next_features = obs_to_features_from_env(task_name, real_obs, env)
+        real_traj.append(next_features if use_feature_traj else np.asarray(real_obs, dtype=np.float32))
         model_traj.append(predicted_next_features.copy())
+        step_errors.append(float(np.sqrt(np.mean((next_features - predicted_next_features) ** 2))))
+        if predicted_s_dot is None:
+            s_dot_errors.append(np.nan)
+        else:
+            derivative_dim = int(getattr(model, "derivative_dim", len(current_features)))
+            derivative_dt = float(getattr(model, "derivative_dt", 1.0))
+            target_s_dot = (next_features[:derivative_dim] - current_features[:derivative_dim]) / derivative_dt
+            s_dot_errors.append(float(np.sqrt(np.mean((target_s_dot - predicted_s_dot[:derivative_dim]) ** 2))))
         if terminated or truncated:
             break
 
-    env.close()
+    keep_env = env if task_name == MECANUM and args.show else None
+    if keep_env is None:
+        env.close()
     used_steps = len(real_traj) - 1
-    return np.asarray(real_traj), np.asarray(model_traj), actions[:used_steps], action_dim
+    diagnostics = {
+        "step_errors": np.asarray(step_errors, dtype=np.float32),
+        "s_dot_errors": np.asarray(s_dot_errors, dtype=np.float32),
+    }
+    return np.asarray(real_traj), np.asarray(model_traj), actions[:used_steps], action_dim, keep_env, diagnostics
 
 
 def theta(task_name: str, obs: np.ndarray) -> np.ndarray:
@@ -174,10 +266,18 @@ def rod_xy(task_name: str, obs: np.ndarray) -> tuple[float, float]:
     return float(np.sin(angle)), float(np.cos(angle))
 
 
-def make_animation(real_traj: np.ndarray, model_traj: np.ndarray, actions: np.ndarray, args: argparse.Namespace) -> FuncAnimation:
+def make_animation(
+    real_traj: np.ndarray,
+    model_traj: np.ndarray,
+    actions: np.ndarray,
+    args: argparse.Namespace,
+    diagnostics: dict[str, np.ndarray] | None = None,
+) -> FuncAnimation:
     task_name = resolve_task_name(args.task)
+    if task_name == MECANUM:
+        return make_feature_animation(real_traj, model_traj, actions, args, diagnostics)
     if task_name == BIPEDALWALKER:
-        return make_feature_animation(real_traj, model_traj, actions, args)
+        return make_feature_animation(real_traj, model_traj, actions, args, diagnostics)
 
     frames = len(real_traj)
     real_features = obs_to_features(task_name, real_traj)
@@ -256,57 +356,99 @@ def make_animation(real_traj: np.ndarray, model_traj: np.ndarray, actions: np.nd
         angle_cursor.set_xdata([frame, frame])
         vel_cursor.set_xdata([frame, frame])
         error = float(np.linalg.norm(real_features[frame] - model_traj[frame]))
-        time_text.set_text(f"step={frame}\none_step_error={error:.3f}")
+        step_rmse = diagnostics["step_errors"][frame] if diagnostics is not None else error
+        s_dot_rmse = diagnostics["s_dot_errors"][frame] if diagnostics is not None else np.nan
+        text = f"step={frame}\none_step_error={error:.3f}\nstep_rmse={step_rmse:.3f}"
+        if not np.isnan(s_dot_rmse):
+            text += f"\ns_dot_rmse={s_dot_rmse:.3f}"
+        time_text.set_text(text)
         return real_line, model_line, real_bob, model_bob, angle_cursor, vel_cursor, time_text
 
     return FuncAnimation(fig, update, frames=frames, interval=1000 / args.fps, blit=True)
 
 
-def make_feature_animation(real_traj: np.ndarray, model_traj: np.ndarray, actions: np.ndarray, args: argparse.Namespace) -> FuncAnimation:
+def make_feature_animation(
+    real_traj: np.ndarray,
+    model_traj: np.ndarray,
+    actions: np.ndarray,
+    args: argparse.Namespace,
+    diagnostics: dict[str, np.ndarray] | None = None,
+) -> FuncAnimation:
     """Animate one-step prediction errors for high-dimensional raw observations."""
     task_name = resolve_task_name(args.task)
-    real_features = obs_to_features(task_name, real_traj)
+    real_features = np.asarray(real_traj, dtype=np.float32)
+    model_features = np.asarray(model_traj, dtype=np.float32)
     frames = len(real_features)
     t = np.arange(frames)
 
-    labels = ["hull angle", "hull angular velocity", "horizontal velocity", "vertical velocity"]
-    feature_count = min(4, real_features.shape[-1])
+    labels = feature_names(task_name)
+    feature_count = min(len(labels), real_features.shape[-1], model_features.shape[-1])
     action_count = actions.shape[-1] if len(actions) > 0 else 0
 
-    fig, axes = plt.subplots(2, 1, figsize=(11, 6), sharex=True)
-    ax_features, ax_actions = axes
-    ax_features.set_title(f"{task_name} one-step prediction: real vs model")
-    ax_features.set_ylabel("feature value")
-    ax_features.grid(True, alpha=0.25)
+    fig_height = max(8.0, 1.15 * feature_count + 2.2)
+    fig, axes = plt.subplots(feature_count + 1, 1, figsize=(12, fig_height), sharex=True)
+    feature_axes = list(axes[:-1])
+    ax_actions = axes[-1]
+    feature_axes[0].set_title(f"{task_name} one-step prediction: real vs model")
     ax_actions.set_title("Actions")
     ax_actions.set_xlabel("step")
     ax_actions.set_ylabel("action")
     ax_actions.grid(True, alpha=0.25)
 
-    colors = ["#1f77b4", "#2ca02c", "#9467bd", "#8c564b"]
+    real_colors = ["#0055ff", "#009e73", "#cc79a7", "#d55e00", "#000000"]
+    model_colors = ["#ffb000", "#7a3cff", "#56b4e9", "#e60049", "#777777"]
+    feature_cursors = []
     for idx in range(feature_count):
         label = labels[idx] if idx < len(labels) else f"obs_{idx}"
-        color = colors[idx % len(colors)]
-        ax_features.plot(t, real_features[:, idx], color=color, label=f"real {label}")
-        ax_features.plot(t, model_traj[:, idx], color=color, linestyle="--", alpha=0.85, label=f"model {label}")
+        ax_feature = feature_axes[idx]
+        real_color = real_colors[idx % len(real_colors)]
+        model_color = model_colors[idx % len(model_colors)]
+        ax_feature.plot(t, real_features[:, idx], color=real_color, linewidth=2.2, label="real")
+        ax_feature.plot(
+            t,
+            model_features[:, idx],
+            color=model_color,
+            linestyle=(0, (6, 2)),
+            linewidth=1.9,
+            alpha=0.95,
+            label="model",
+        )
+        ax_feature.set_ylabel(label, rotation=0, ha="right", va="center")
+        ax_feature.grid(True, alpha=0.25)
+        ax_feature.tick_params(axis="y", labelsize=8)
+        if idx == 0:
+            ax_feature.legend(loc="upper right", ncol=2, fontsize=8)
+        feature_cursors.append(ax_feature.axvline(0, color="black", linewidth=1.6, alpha=0.55))
 
     action_t = np.arange(len(actions))
+    action_colors = ["#0072b2", "#f0e442", "#009e73", "#d55e00"]
     for idx in range(action_count):
-        ax_actions.plot(action_t, actions[:, idx], alpha=0.85, label=f"action {idx}")
+        ax_actions.plot(
+            action_t,
+            actions[:, idx],
+            color=action_colors[idx % len(action_colors)],
+            linewidth=2.2,
+            alpha=0.95,
+            label=f"action {idx}",
+        )
 
-    feature_cursor = ax_features.axvline(0, color="black", alpha=0.35)
-    action_cursor = ax_actions.axvline(0, color="black", alpha=0.35)
-    error_text = ax_features.text(0.01, 0.97, "", transform=ax_features.transAxes, va="top")
-    ax_features.legend(loc="upper right", ncol=2, fontsize=8)
+    action_cursor = ax_actions.axvline(0, color="black", linewidth=2.0, alpha=0.55)
+    error_text = feature_axes[0].text(0.01, 0.94, "", transform=feature_axes[0].transAxes, va="top")
     ax_actions.legend(loc="upper right", ncol=2, fontsize=8)
     fig.tight_layout()
 
     def update(frame: int):
-        feature_cursor.set_xdata([frame, frame])
+        for cursor in feature_cursors:
+            cursor.set_xdata([frame, frame])
         action_cursor.set_xdata([frame, frame])
-        error = float(np.linalg.norm(real_features[frame] - model_traj[frame]))
-        error_text.set_text(f"step={frame}\none_step_error={error:.3f}")
-        return feature_cursor, action_cursor, error_text
+        error = float(np.linalg.norm(real_features[frame] - model_features[frame]))
+        step_rmse = diagnostics["step_errors"][frame] if diagnostics is not None else error
+        s_dot_rmse = diagnostics["s_dot_errors"][frame] if diagnostics is not None else np.nan
+        text = f"step={frame}\none_step_error={error:.3f}\nstep_rmse={step_rmse:.3f}"
+        if not np.isnan(s_dot_rmse):
+            text += f"\ns_dot_rmse={s_dot_rmse:.3f}"
+        error_text.set_text(text)
+        return (*feature_cursors, action_cursor, error_text)
 
     return FuncAnimation(fig, update, frames=frames, interval=1000 / args.fps, blit=True)
 
@@ -335,15 +477,19 @@ def main() -> None:
     env.close()
 
     model = load_model(checkpoint, obs_dim, action_dim, device)
-    real_traj, model_traj, actions, _ = rollout(args, model, device)
-    anim = make_animation(real_traj, model_traj, actions, args)
+    real_traj, model_traj, actions, _, keep_env, diagnostics = rollout(args, model, device)
+    try:
+        anim = make_animation(real_traj, model_traj, actions, args, diagnostics)
 
-    if args.output is not None:
-        save_animation(anim, args.output, args.fps)
-        print(f"Saved visualization to {args.output}")
+        if args.output is not None:
+            save_animation(anim, args.output, args.fps)
+            print(f"Saved visualization to {args.output}")
 
-    if args.show or args.output is None:
-        plt.show()
+        if args.show or args.output is None:
+            plt.show()
+    finally:
+        if keep_env is not None:
+            keep_env.close()
 
 
 if __name__ == "__main__":

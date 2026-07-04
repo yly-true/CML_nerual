@@ -9,9 +9,11 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-CML_LATENT_DIM = 16
-CML_HIDDEN_DIMS = [64, 64]
+CML_LATENT_DIM = 256
+CML_HIDDEN_DIMS = [128, 128]
 CML_NETWORK_TYPE = "mlp"
+CML_DYNAMICS_MODE = "latent"
+CML_DERIVATIVE_DT = 0.02
 CML_SNN_TIMESTEPS = 16
 CML_SNN_TAU = 2.0
 CML_SNN_THRESHOLD = 0.5
@@ -158,6 +160,7 @@ class CMLLossOutput:
     total: torch.Tensor
     pred: torch.Tensor
     recon: torch.Tensor
+    dot: torch.Tensor
     continuity: torch.Tensor
     action_norm: torch.Tensor
     latent_norm: torch.Tensor
@@ -169,7 +172,7 @@ class NeuralCML(nn.Module):
     对于观测 o_t 和动作 a_t：
 
         s_t = encoder(o_t)
-        delta_t = action_encoder([s_t, a_t])
+        delta_t = action_encoder([o_t, a_t])
         s_next_hat = s_t + delta_t
 
     这里保留了论文里“动作在状态空间中对应位移”的核心想法，
@@ -183,6 +186,9 @@ class NeuralCML(nn.Module):
         latent_dim: int = CML_LATENT_DIM,
         hidden_dims: Sequence[int] | None = None,
         network_type: str = CML_NETWORK_TYPE,
+        dynamics_mode: str = CML_DYNAMICS_MODE,
+        derivative_dt: float = CML_DERIVATIVE_DT,
+        derivative_dim: int | None = None,
         snn_timesteps: int = CML_SNN_TIMESTEPS,
         snn_tau: float = CML_SNN_TAU,
         snn_threshold: float = CML_SNN_THRESHOLD,
@@ -194,7 +200,14 @@ class NeuralCML(nn.Module):
         hidden_dims = tuple(int(dim) for dim in hidden_dims)
         self.obs_dim = obs_dim
         self.action_dim = action_dim
-        self.latent_dim = latent_dim
+        if dynamics_mode not in ("latent", "obs_derivative"):
+            raise ValueError(f"Unsupported dynamics_mode: {dynamics_mode}")
+        self.dynamics_mode = dynamics_mode
+        self.derivative_dt = float(derivative_dt)
+        self.derivative_dim = obs_dim if derivative_dim is None else int(derivative_dim)
+        if self.derivative_dim < 1 or self.derivative_dim > obs_dim:
+            raise ValueError(f"derivative_dim must be in [1, {obs_dim}], got {self.derivative_dim}.")
+        self.latent_dim = obs_dim if dynamics_mode == "obs_derivative" else latent_dim
         self.hidden_dims = hidden_dims
         self.network_type = network_type
         self.snn_timesteps = int(snn_timesteps)
@@ -202,58 +215,113 @@ class NeuralCML(nn.Module):
         self.snn_threshold = float(snn_threshold)
         self.snn_surrogate_scale = float(snn_surrogate_scale)
 
-        self.encoder = build_network(
-            obs_dim,
-            hidden_dims,
-            latent_dim,
-            network_type,
-            self.snn_timesteps,
-            self.snn_tau,
-            self.snn_threshold,
-            self.snn_surrogate_scale,
-        )
-        self.decoder = build_network(
-            latent_dim,
-            hidden_dims,
-            obs_dim,
-            network_type,
-            self.snn_timesteps,
-            self.snn_tau,
-            self.snn_threshold,
-            self.snn_surrogate_scale,
-        )
-        self.action_encoder = build_network(
-            latent_dim + action_dim,
-            hidden_dims,
-            latent_dim,
-            network_type,
-            self.snn_timesteps,
-            self.snn_tau,
-            self.snn_threshold,
-            self.snn_surrogate_scale,
-        )
+        if self.dynamics_mode == "latent":
+            self.encoder = build_network(
+                obs_dim,
+                hidden_dims,
+                self.latent_dim,
+                network_type,
+                self.snn_timesteps,
+                self.snn_tau,
+                self.snn_threshold,
+                self.snn_surrogate_scale,
+            )
+            self.decoder = build_network(
+                self.latent_dim,
+                hidden_dims,
+                obs_dim,
+                network_type,
+                self.snn_timesteps,
+                self.snn_tau,
+                self.snn_threshold,
+                self.snn_surrogate_scale,
+            )
+            self.action_encoder = build_network(
+                obs_dim + action_dim,
+                hidden_dims,
+                self.latent_dim,
+                network_type,
+                self.snn_timesteps,
+                self.snn_tau,
+                self.snn_threshold,
+                self.snn_surrogate_scale,
+            )
+            self.derivative_net = None
+        else:
+            self.encoder = None
+            self.decoder = None
+            self.action_encoder = None
+            self.derivative_net = build_network(
+                obs_dim + action_dim,
+                hidden_dims,
+                self.derivative_dim,
+                network_type,
+                self.snn_timesteps,
+                self.snn_tau,
+                self.snn_threshold,
+                self.snn_surrogate_scale,
+            )
 
     def encode(self, obs: torch.Tensor) -> torch.Tensor:
         """将观测编码到 latent state。"""
+        if self.dynamics_mode == "obs_derivative":
+            return obs
+        if self.encoder is None:
+            raise RuntimeError("Encoder is not available for this dynamics mode.")
         return self.encoder(obs)
 
     def decode(self, state: torch.Tensor) -> torch.Tensor:
         """将 latent state 解码回观测空间。"""
+        if self.dynamics_mode == "obs_derivative":
+            return state
+        if self.decoder is None:
+            raise RuntimeError("Decoder is not available for this dynamics mode.")
         return self.decoder(state)
 
-    def action_delta(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        """根据当前 latent state 和动作预测 latent 空间中的位移向量。"""
-        action_in = torch.cat([state, action], dim=-1)
+    def action_delta(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """根据当前 observation feature 和动作预测 latent 空间中的位移向量。"""
+        if self.action_encoder is None:
+            raise RuntimeError("action_delta is only available in latent dynamics mode.")
+        action_in = torch.cat([obs, action], dim=-1)
         return self.action_encoder(action_in)
 
-    def transition(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        """执行一步 latent 转移。"""
-        return state + self.action_delta(state, action)
+    def obs_derivative(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """Predict d(obs[:derivative_dim]) / dt from current observation and action."""
+        if self.derivative_net is None:
+            raise RuntimeError("obs_derivative is only available in obs_derivative dynamics mode.")
+        derivative_in = torch.cat([obs, action], dim=-1)
+        return self.derivative_net(derivative_in)
+
+    def predict_next_obs(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """Predict the next observation for the configured dynamics mode."""
+        if self.dynamics_mode == "latent":
+            state = self.encode(obs)
+            return self.decode(self.transition(state, action, obs))
+
+        obs_dot = self.obs_derivative(obs, action)
+        next_obs = obs.clone()
+        next_obs[..., : self.derivative_dim] = obs[..., : self.derivative_dim] + self.derivative_dt * obs_dot
+        return next_obs
+
+    def transition(self, state: torch.Tensor, action: torch.Tensor, obs: torch.Tensor | None = None) -> torch.Tensor:
+        """执行一步 latent 转移。
+
+        action_encoder uses [obs, action]. During imagined rollouts, obs is
+        decoded from the current latent state when a real observation is not
+        available.
+        """
+        if self.dynamics_mode == "obs_derivative":
+            if obs is None:
+                obs = state
+            return self.predict_next_obs(obs, action)
+        if obs is None:
+            obs = self.decode(state)
+        return state + self.action_delta(obs, action)
 
     def forward(self, obs: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """返回当前 latent state 和预测的下一 latent state。"""
         state = self.encode(obs)
-        next_state_hat = self.transition(state, action)
+        next_state_hat = self.transition(state, action, obs)
         return state, next_state_hat
 
     def loss(
@@ -276,6 +344,27 @@ class NeuralCML(nn.Module):
         2. 观测重建误差
         3. action delta 的范数正则
         """
+        if self.dynamics_mode == "obs_derivative":
+            state, next_obs_hat = self.forward(obs, action)
+            obs_dot_hat = self.obs_derivative(obs, action)
+            obs_dot_target = (next_obs[..., : self.derivative_dim] - obs[..., : self.derivative_dim]) / self.derivative_dt
+            derivative_weights = None
+            if recon_weights is not None:
+                derivative_weights = recon_weights[: self.derivative_dim]
+            pred = weighted_mse(next_obs_hat, next_obs, recon_weights)
+            recon = weighted_mse(obs_dot_hat, obs_dot_target, derivative_weights)
+            continuity = pred.new_zeros(())
+            action_norm = obs_dot_hat.pow(2).mean()
+            latent_norm = state.pow(2).mean()
+            total = (
+                pred_weight * pred
+                + recon_weight * recon
+                + continuity_weight * continuity
+                + action_norm_weight * action_norm
+                + latent_norm_weight * latent_norm
+            )
+            return CMLLossOutput(total, pred, recon, recon, continuity, action_norm, latent_norm)
+
         state, next_state_hat = self.forward(obs, action)
         with torch.no_grad():
             next_state_target = self.encode(next_obs)
@@ -286,11 +375,11 @@ class NeuralCML(nn.Module):
         # 重建项防止 latent 只会做转移预测，却丢失观测信息。
         obs_hat = self.decode(state)
         next_obs_hat = self.decode(next_state_hat)
-        recon = 0.5 * weighted_mse(obs_hat, obs, recon_weights) + 0.5 * weighted_mse(next_obs_hat, next_obs, recon_weights)
+        recon = weighted_mse(obs_hat, obs, recon_weights) + weighted_mse(next_obs_hat, next_obs, recon_weights)
         continuity = cartpole_continuity_loss(obs, next_obs_hat, continuity_dt) if continuity_weight > 0.0 else pred.new_zeros(())
 
         # 正则项约束 latent 几何不要过度发散。
-        action_delta = self.action_delta(state, action)
+        action_delta = self.action_delta(obs, action)
         action_norm = action_delta.pow(2).mean()
         latent_norm = 0.5 * state.pow(2).mean() + 0.5 * next_state_hat.pow(2).mean()
 
@@ -301,7 +390,8 @@ class NeuralCML(nn.Module):
             + action_norm_weight * action_norm
             + latent_norm_weight * latent_norm
         )
-        return CMLLossOutput(total, pred, recon, continuity, action_norm, latent_norm)
+        dot = pred.new_zeros(())
+        return CMLLossOutput(total, pred, recon, dot, continuity, action_norm, latent_norm)
 
 
 def weighted_mse(pred: torch.Tensor, target: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
@@ -408,7 +498,7 @@ def plan_action_continuous(
 
             for _ in range(opt_steps):
                 optimizer.zero_grad(set_to_none=True)
-                delta = model.transition(state, action) - state
+                delta = model.transition(state, action, obs.view(1, -1)) - state
                 utility = (direction * delta).sum(dim=-1) - action_cost * action.pow(2).sum(dim=-1)
                 loss = -utility.mean()
                 loss.backward()
@@ -456,6 +546,7 @@ def score_action_sequences(
     goal_batch = goal_obs.unsqueeze(0).repeat(num_sequences, 1)
 
     state = model.encode(obs_batch)
+    rollout_obs = obs_batch
     use_latent = objective.startswith("latent")
     use_obs = objective.startswith("obs")
     use_trajectory = objective.endswith("trajectory")
@@ -474,29 +565,146 @@ def score_action_sequences(
     total_action_cost = torch.zeros(num_sequences, device=device)
     for t in range(horizon):
         a_t = actions[:, t, :]
-        state = model.transition(state, a_t)
+        state = model.transition(state, a_t, rollout_obs)
+        rollout_obs = model.decode(state)
         total_action_cost += a_t.pow(2).mean(dim=-1)
 
         if use_trajectory:
             if use_latent:
                 step_distance = ((state - goal_state).pow(2) * weights.view(1, -1)).mean(dim=-1)
             else:
-                pred_obs = model.decode(state)
-                step_distance = ((pred_obs - goal_raw).pow(2) * weights.view(1, -1)).mean(dim=-1)
+                step_distance = ((rollout_obs - goal_raw).pow(2) * weights.view(1, -1)).mean(dim=-1)
             distance_cost += step_distance
 
     if use_terminal:
         if use_latent:
             terminal_distance = ((state - goal_state).pow(2) * weights.view(1, -1)).mean(dim=-1)
         else:
-            pred_obs = model.decode(state)
-            terminal_distance = ((pred_obs - goal_raw).pow(2) * weights.view(1, -1)).mean(dim=-1)
+            terminal_distance = ((rollout_obs - goal_raw).pow(2) * weights.view(1, -1)).mean(dim=-1)
         distance_cost = terminal_weight * terminal_distance
     else:
         distance_cost = distance_cost / max(horizon, 1)
 
     score = -distance_cost - action_cost * total_action_cost
     return score
+
+
+def action_sequence_cost(
+    model: NeuralCML,
+    obs: torch.Tensor,
+    goal_obs: torch.Tensor,
+    actions: torch.Tensor,
+    action_cost: float = 0.001,
+    objective: str = "obs-trajectory",
+    obs_weights: torch.Tensor | None = None,
+    terminal_weight: float = 1.0,
+    action_smooth_cost: float = 0.0,
+) -> torch.Tensor:
+    """Differentiable MPC cost for a single action sequence.
+
+    This is nonlinear MPC over the learned neural dynamics. The cost has the
+    usual quadratic tracking/action form, but the dynamics are not linearized
+    into a QP.
+    """
+    if actions.dim() != 2:
+        raise ValueError("actions must have shape [horizon, action_dim].")
+
+    horizon = actions.shape[0]
+    state = model.encode(obs.view(1, -1))
+    rollout_obs = obs.view(1, -1)
+    goal_batch = goal_obs.view(1, -1)
+    use_latent = objective.startswith("latent")
+    use_obs = objective.startswith("obs")
+    use_trajectory = objective.endswith("trajectory")
+    use_terminal = objective.endswith("terminal")
+    if not ((use_latent or use_obs) and (use_trajectory or use_terminal)):
+        raise ValueError(f"Unsupported objective: {objective}")
+
+    if use_latent:
+        goal_state = model.encode(goal_batch)
+        weights = torch.ones(model.latent_dim, dtype=torch.float32, device=obs.device)
+    else:
+        weights = _normalize_weights(obs_weights, model.obs_dim, obs.device)
+
+    distance_cost = obs.new_zeros(())
+    for t in range(horizon):
+        action_t = actions[t].view(1, -1)
+        state = model.transition(state, action_t, rollout_obs)
+        rollout_obs = model.decode(state)
+        if use_trajectory:
+            if use_latent:
+                step_distance = ((state - goal_state).pow(2) * weights.view(1, -1)).mean()
+            else:
+                step_distance = ((rollout_obs - goal_batch).pow(2) * weights.view(1, -1)).mean()
+            distance_cost = distance_cost + step_distance
+
+    if use_terminal:
+        if use_latent:
+            distance_cost = terminal_weight * ((state - goal_state).pow(2) * weights.view(1, -1)).mean()
+        else:
+            distance_cost = terminal_weight * ((rollout_obs - goal_batch).pow(2) * weights.view(1, -1)).mean()
+    else:
+        distance_cost = distance_cost / max(horizon, 1)
+
+    control_cost = action_cost * actions.pow(2).mean()
+    smooth_cost = obs.new_zeros(())
+    if action_smooth_cost > 0.0 and horizon > 1:
+        smooth_cost = action_smooth_cost * (actions[1:] - actions[:-1]).pow(2).mean()
+    return distance_cost + control_cost + smooth_cost
+
+
+def plan_action_gradient_mpc(
+    model: NeuralCML,
+    obs: torch.Tensor,
+    goal_obs: torch.Tensor,
+    action_low: torch.Tensor,
+    action_high: torch.Tensor,
+    horizon: int = 8,
+    action_cost: float = 0.001,
+    objective: str = "obs-trajectory",
+    opt_steps: int = 32,
+    opt_lr: float = 0.05,
+    obs_weights: torch.Tensor | None = None,
+    terminal_weight: float = 1.0,
+    action_smooth_cost: float = 0.0,
+) -> torch.Tensor:
+    """Optimize a finite-horizon action sequence by gradient-based NMPC."""
+    action_dim = action_low.shape[-1]
+    low = action_low.view(1, action_dim)
+    high = action_high.view(1, action_dim)
+    action_span = torch.clamp(high - low, min=1e-6)
+    requires_grad = [param.requires_grad for param in model.parameters()]
+
+    try:
+        for param in model.parameters():
+            param.requires_grad_(False)
+
+        raw_actions = torch.zeros((horizon, action_dim), dtype=torch.float32, device=obs.device, requires_grad=True)
+        optimizer = torch.optim.Adam([raw_actions], lr=opt_lr)
+
+        for _ in range(opt_steps):
+            optimizer.zero_grad(set_to_none=True)
+            actions = low + action_span * torch.sigmoid(raw_actions)
+            cost = action_sequence_cost(
+                model=model,
+                obs=obs,
+                goal_obs=goal_obs,
+                actions=actions,
+                action_cost=action_cost,
+                objective=objective,
+                obs_weights=obs_weights,
+                terminal_weight=terminal_weight,
+                action_smooth_cost=action_smooth_cost,
+            )
+            cost.backward()
+            optimizer.step()
+
+        with torch.no_grad():
+            actions = low + action_span * torch.sigmoid(raw_actions)
+            return actions[0].detach()
+    finally:
+        for param, old_requires_grad in zip(model.parameters(), requires_grad):
+            param.requires_grad_(old_requires_grad)
 
 
 @torch.no_grad()

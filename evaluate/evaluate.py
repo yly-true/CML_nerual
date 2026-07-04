@@ -13,6 +13,8 @@ import numpy as np
 import torch
 
 from cml.cml_model import (
+    CML_DERIVATIVE_DT,
+    CML_DYNAMICS_MODE,
     CML_HIDDEN_DIMS,
     CML_LATENT_DIM,
     CML_SNN_SURROGATE_SCALE,
@@ -21,26 +23,33 @@ from cml.cml_model import (
     CML_SNN_TIMESTEPS,
     NeuralCML,
     plan_action_cem,
+    plan_action_gradient_mpc,
     plan_action_random_shooting,
 )
-from cml.tasks import feature_dim, feature_names, format_obs, obs_to_features, reset_eval_env, resolve_env_id, resolve_task_name, target_features
+from cml.tasks import BIPEDALWALKER_DEFAULT_HULL_HEIGHT, feature_dim, feature_names, format_obs, obs_to_features_from_env, reset_eval_env, resolve_env_id, resolve_task_name, target_features
 from cml.utils import get_dims, make_env, resolve_device
+
+BIPEDALWALKER_DEFAULT_OBS_COST_WEIGHTS = [2.0, 3.0, 1.0, 5.0, 2.0] + [1.0] * 8
+MECANUM_DEFAULT_OBS_COST_WEIGHTS = [5.0, 5.0, 5.0] + [0.0] * 4
 
 
 def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(description="评估连续控制任务上的 Neural CML")
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--task", choices=("pendulum", "cartpole", "bipedalwalker"), default="pendulum")
+    parser.add_argument("--task", choices=("pendulum", "cartpole", "bipedalwalker", "mecanum"), default="pendulum")
     parser.add_argument("--episodes", type=int, default=1000)
     parser.add_argument("--max-steps", type=int, default=2000)
-    parser.add_argument("--planner", type=str, choices=("random", "cem"), default="cem")
-    parser.add_argument("--num-sequences", type=int, default=2048)
-    parser.add_argument("--horizon", type=int, default=10)
+    parser.add_argument("--planner", type=str, choices=("random", "cem", "gradient"), default="random")
+    parser.add_argument("--num-sequences", type=int, default=90000)
+    parser.add_argument("--horizon", type=int, default=5)
     parser.add_argument("--cem-iterations", type=int, default=4)
     parser.add_argument("--cem-elite-frac", type=float, default=0.1)
+    parser.add_argument("--mpc-opt-steps", type=int, default=32)
+    parser.add_argument("--mpc-opt-lr", type=float, default=0.05)
     parser.add_argument("--action-cost", type=float, default=0)
-    parser.add_argument("--action-sampling", type=str, choices=("uniform", "gaussian"), default="gaussian")
+    parser.add_argument("--action-smooth-cost", type=float, default=0.0)
+    parser.add_argument("--action-sampling", type=str, choices=("uniform", "gaussian"), default="uniform")
     parser.add_argument(
         "--action-std",
         type=float,
@@ -50,10 +59,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--target-angular-velocity", type=float, default=0.0)
     parser.add_argument("--target-cart-position", type=float, default=0.0)
+    parser.add_argument("--target-bipedalwalker-hull-height", type=float, default=BIPEDALWALKER_DEFAULT_HULL_HEIGHT)
     parser.add_argument("--target-bipedalwalker-hull-angle", type=float, default=0.0)
     parser.add_argument("--target-bipedalwalker-hull-angular-velocity", type=float, default=0.0)
-    parser.add_argument("--target-bipedalwalker-horizontal-velocity", type=float, default=1.0)
+    parser.add_argument("--target-bipedalwalker-horizontal-velocity", type=float, default=0.0)
     parser.add_argument("--target-bipedalwalker-vertical-velocity", type=float, default=0.0)
+    parser.add_argument("--target-mecanum-vx", type=float, default=-0.5)
+    parser.add_argument("--target-mecanum-vy", type=float, default=0.0)
+    parser.add_argument("--target-mecanum-yaw-rate", type=float, default=0.0)
     parser.add_argument("--initial-cart-position", type=float, default=None, help="CartPole initial x. Defaults to 0 when any CartPole initial option is set.")
     parser.add_argument("--initial-cart-velocity", type=float, default=None, help="CartPole initial xdot. Defaults to 0 when any CartPole initial option is set.")
     parser.add_argument("--initial-pole-angle", type=float, default=None, help="CartPole initial theta in radians. Defaults to 0 when any CartPole initial option is set.")
@@ -103,7 +116,9 @@ def print_model_size(model: NeuralCML, model_args: dict, obs_dim: int, action_di
         "Model size: "
         f"obs_dim={obs_dim}, action_dim={action_dim}, "
         f"latent_dim={model_args['latent_dim']}, hidden_dims={model_args['hidden_dims']}, "
-        f"network_type={model_args['network_type']}, snn_timesteps={model_args['snn_timesteps']}, "
+        f"network_type={model_args['network_type']}, dynamics_mode={model_args['dynamics_mode']}, "
+        f"derivative_dt={model_args['derivative_dt']}, derivative_dim={model_args['derivative_dim']}, "
+        f"snn_timesteps={model_args['snn_timesteps']}, "
         f"snn_tau={model_args['snn_tau']}, snn_threshold={model_args['snn_threshold']}, "
         f"params={total_params:,}, trainable={trainable_params:,}, param_memory={param_mb:.3f} MB"
     )
@@ -118,13 +133,16 @@ def resolve_hidden_dims(saved_args: dict) -> list[int]:
     return [int(dim) for dim in CML_HIDDEN_DIMS]
 
 
-def resolve_model_args(ckpt: dict) -> dict[str, object]:
+def resolve_model_args(ckpt: dict, obs_dim: int) -> dict[str, object]:
     """Read model structure from checkpoint, falling back to cml_model.py defaults."""
     saved_args = ckpt.get("args", {})
     return {
         "latent_dim": int(saved_args.get("latent_dim", CML_LATENT_DIM)),
         "hidden_dims": resolve_hidden_dims(saved_args),
         "network_type": saved_args.get("network_type", "mlp"),
+        "dynamics_mode": saved_args.get("dynamics_mode", CML_DYNAMICS_MODE),
+        "derivative_dt": float(saved_args.get("derivative_dt", CML_DERIVATIVE_DT)),
+        "derivative_dim": int(saved_args.get("derivative_dim", obs_dim)),
         "snn_timesteps": int(saved_args.get("snn_timesteps", CML_SNN_TIMESTEPS)),
         "snn_tau": float(saved_args.get("snn_tau", CML_SNN_TAU)),
         "snn_threshold": float(saved_args.get("snn_threshold", CML_SNN_THRESHOLD)),
@@ -135,13 +153,16 @@ def resolve_model_args(ckpt: dict) -> dict[str, object]:
 def load_model(args: argparse.Namespace, obs_dim: int, action_dim: int, device: torch.device):
     """从 checkpoint 恢复模型。"""
     ckpt = torch_load_checkpoint(args.checkpoint, device)
-    model_args = resolve_model_args(ckpt)
+    model_args = resolve_model_args(ckpt, obs_dim)
     model = NeuralCML(
         obs_dim=obs_dim,
         action_dim=action_dim,
         latent_dim=model_args["latent_dim"],
         hidden_dims=model_args["hidden_dims"],
         network_type=model_args["network_type"],
+        dynamics_mode=model_args["dynamics_mode"],
+        derivative_dt=model_args["derivative_dt"],
+        derivative_dim=model_args["derivative_dim"],
         snn_timesteps=model_args["snn_timesteps"],
         snn_tau=model_args["snn_tau"],
         snn_threshold=model_args["snn_threshold"],
@@ -170,11 +191,7 @@ def prepare_planner_inputs(
     """构造规划阶段反复使用的常量张量。"""
     action_low = torch.as_tensor(env.action_space.low, dtype=torch.float32, device=device)
     action_high = torch.as_tensor(env.action_space.high, dtype=torch.float32, device=device)
-    obs_weights_t = None
-    if args.obs_cost_weights is not None:
-        if len(args.obs_cost_weights) != obs_dim:
-            raise ValueError(f"--obs-cost-weights must contain {obs_dim} values for this task.")
-        obs_weights_t = torch.as_tensor(args.obs_cost_weights, dtype=torch.float32, device=device)
+    obs_weights_t = torch.as_tensor(resolve_obs_cost_weights(args, obs_dim), dtype=torch.float32, device=device)
     action_std_t = None
     if args.action_std is not None:
         if len(args.action_std) == 0:
@@ -194,6 +211,19 @@ def prepare_planner_inputs(
         obs_weights_t=obs_weights_t,
         action_std_t=action_std_t,
     )
+
+
+def resolve_obs_cost_weights(args: argparse.Namespace, obs_dim: int) -> list[float]:
+    """Return observation-cost weights for MPC."""
+    if args.obs_cost_weights is not None:
+        if len(args.obs_cost_weights) != obs_dim:
+            raise ValueError(f"--obs-cost-weights must contain {obs_dim} values for this task.")
+        return [float(weight) for weight in args.obs_cost_weights]
+    if args.task == "bipedalwalker":
+        return BIPEDALWALKER_DEFAULT_OBS_COST_WEIGHTS[:obs_dim]
+    if args.task == "mecanum":
+        return MECANUM_DEFAULT_OBS_COST_WEIGHTS[:obs_dim]
+    return [1.0] * obs_dim
 
 
 def maybe_render(env, args: argparse.Namespace) -> None:
@@ -332,6 +362,21 @@ def plan_action_mpc(
     args: argparse.Namespace,
 ) -> torch.Tensor:
     """Plan an action sequence with the learned model and execute the first action."""
+    if args.planner == "gradient":
+        return plan_action_gradient_mpc(
+            model=model,
+            obs=obs_t,
+            goal_obs=goal_t,
+            action_low=planner_inputs.action_low,
+            action_high=planner_inputs.action_high,
+            horizon=args.horizon,
+            action_cost=args.action_cost,
+            objective=objective,
+            opt_steps=args.mpc_opt_steps,
+            opt_lr=args.mpc_opt_lr,
+            obs_weights=planner_inputs.obs_weights_t,
+            action_smooth_cost=args.action_smooth_cost,
+        )
     if args.planner == "cem":
         return plan_action_cem(
             model=model,
@@ -363,6 +408,31 @@ def plan_action_mpc(
     )
 
 
+@torch.no_grad()
+def model_step_diagnostics(
+    model: NeuralCML,
+    obs_features: np.ndarray,
+    action: np.ndarray,
+    next_features: np.ndarray,
+    device: torch.device,
+) -> dict[str, float]:
+    """Measure one-step model error against the real simulator transition."""
+    obs_t = torch.as_tensor(obs_features.astype(np.float32), dtype=torch.float32, device=device).view(1, -1)
+    action_t = torch.as_tensor(action.astype(np.float32), dtype=torch.float32, device=device).view(1, -1)
+    next_t = torch.as_tensor(next_features.astype(np.float32), dtype=torch.float32, device=device).view(1, -1)
+
+    next_hat = model.predict_next_obs(obs_t, action_t)
+    step_rmse = torch.sqrt((next_hat - next_t).pow(2).mean()).item()
+    diagnostics = {"step_rmse": step_rmse}
+
+    if getattr(model, "dynamics_mode", "latent") == "obs_derivative":
+        obs_dot_hat = model.obs_derivative(obs_t, action_t)
+        obs_dot_target = (next_t[..., : model.derivative_dim] - obs_t[..., : model.derivative_dim]) / model.derivative_dt
+        diagnostics["s_dot_rmse"] = torch.sqrt((obs_dot_hat - obs_dot_target).pow(2).mean()).item()
+
+    return diagnostics
+
+
 def run_episode(
     env,
     model: NeuralCML,
@@ -384,7 +454,7 @@ def run_episode(
                 obs = reset_env_to_initial_state(task_name, env, args)
                 continue
 
-            obs_features = obs_to_features(task_name, obs)
+            obs_features = obs_to_features_from_env(task_name, obs, env)
             obs_t = torch.as_tensor(obs_features.astype(np.float32), dtype=torch.float32, device=device)
 
             goal_features = target_features(task_name, args)
@@ -401,11 +471,14 @@ def run_episode(
             action = action_t.detach().cpu().numpy()
 
             obs, reward, terminated, truncated, _ = env.step(action)
+            next_features = obs_to_features_from_env(task_name, obs, env)
+            diagnostics = model_step_diagnostics(model, obs_features, action, next_features, device)
             ep_return += float(reward)
             ep_len += 1
             if args.log_every > 0 and ep_len % args.log_every == 0:
                 target = target_features(task_name, args)
-                print(f"{format_obs(task_name, 'obs', obs)}, target={target}")
+                diag_text = ", ".join(f"{name}={value:.4f}" for name, value in diagnostics.items())
+                print(f"{format_obs(task_name, 'obs', obs)}, target={target}, {diag_text}")
 
             if args.render_every > 0 and ep_len % args.render_every == 0:
                 maybe_render(env, args)
@@ -433,9 +506,11 @@ def main() -> None:
         f"task={task_name}, env_id={env_id}, mode={args.inference_mode}, planner={args.planner}, "
         f"objective={objective_from_inference_mode(args.inference_mode)}, "
         f"features={feature_names(task_name)}, action_cost={args.action_cost}, "
+        f"action_smooth_cost={args.action_smooth_cost}, "
         f"action_sampling={args.action_sampling}, action_std={args.action_std}, "
         f"num_sequences={args.num_sequences}, horizon={args.horizon}, "
-        f"cem_iterations={args.cem_iterations}, cem_elite_frac={args.cem_elite_frac}"
+        f"cem_iterations={args.cem_iterations}, cem_elite_frac={args.cem_elite_frac}, "
+        f"mpc_opt_steps={args.mpc_opt_steps}, mpc_opt_lr={args.mpc_opt_lr}"
     )
     print(f"target: {target_features(task_name, args)}")
     if args.render:

@@ -17,6 +17,10 @@ def make_env(env_id: str, render_mode: str | None = None):
         from cml.tasks import make_continuous_cartpole_env
 
         return make_continuous_cartpole_env(render_mode=render_mode)
+    if env_id == "MecanumDrive-v0":
+        from cml.mecanum_env import MecanumDriveEnv
+
+        return MecanumDriveEnv(render_mode=render_mode)
     make_kwargs = {}
     if render_mode is not None:
         make_kwargs["render_mode"] = render_mode
