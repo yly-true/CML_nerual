@@ -30,7 +30,7 @@ from cml.cml_model import (
     NeuralCML,
 )
 from cml.replay_buffer import ReplayBuffer
-from cml.tasks import feature_dim, obs_to_features_from_env, reset_train_env, resolve_env_id, resolve_task_name
+from cml.tasks import SUPPORTED_TASKS, feature_dim, obs_to_features_from_env, reset_train_env, resolve_env_id, resolve_task_name
 from cml.utils import (
     get_dims,
     make_env,
@@ -40,14 +40,13 @@ from cml.utils import (
 
 
 DEFAULT_CARTPOLE_RECON_WEIGHTS = [5.0, 1.0, 5.0, 5.0, 1.0]
-DEFAULT_BIPEDALWALKER_RECON_WEIGHTS = [15.0, 15.0, 15.0, 15.0, 15.0] + [15.0] * 8
 DEFAULT_MECANUM_RECON_WEIGHTS = [10.0, 10.0, 10.0] + [2.0] * 4
 
 
 def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(description="训练连续控制任务上的 Neural CML")
-    parser.add_argument("--task", choices=("pendulum", "cartpole", "bipedalwalker", "mecanum"), default="cartpole")
+    parser.add_argument("--task", choices=SUPPORTED_TASKS, default="cartpole")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--total-env-steps", type=int, default=300_000)
     parser.add_argument("--buffer-size", type=int, default=300_000)
@@ -328,8 +327,6 @@ def prepare_dataset(args: argparse.Namespace):
     obs_dim = feature_dim(args.task, raw_obs_dim)
     if args.recon_weights is None and args.task == "cartpole":
         args.recon_weights = DEFAULT_CARTPOLE_RECON_WEIGHTS.copy()
-    if args.recon_weights is None and args.task == "bipedalwalker":
-        args.recon_weights = DEFAULT_BIPEDALWALKER_RECON_WEIGHTS.copy()
     if args.recon_weights is None and args.task == "mecanum":
         args.recon_weights = DEFAULT_MECANUM_RECON_WEIGHTS.copy()
     buffer = ReplayBuffer(obs_dim, action_dim, args.buffer_size)

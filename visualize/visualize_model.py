@@ -23,10 +23,10 @@ from cml.cml_model import (
     NeuralCML,
 )
 from cml.tasks import (
-    BIPEDALWALKER,
     CARTPOLE,
     MECANUM,
     PENDULUM,
+    SUPPORTED_TASKS,
     feature_dim,
     feature_names,
     obs_to_features,
@@ -40,11 +40,11 @@ from cml.utils import get_dims, make_env, resolve_device
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="可视化 Pendulum-v1 Neural CML 虚拟仿真器")
     parser.add_argument("--checkpoint", type=str, default=None, help="默认自动使用 runs 里的最新 checkpoint。")
-    parser.add_argument("--task", choices=("pendulum", "cartpole", "bipedalwalker", "mecanum"), default="pendulum")
+    parser.add_argument("--task", choices=SUPPORTED_TASKS, default="pendulum")
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--action-mode", choices=("constant", "random", "sine", "zero"), default="constant")
+    parser.add_argument("--action-mode", choices=("constant", "random", "sine", "zero"), default="sine")
     parser.add_argument(
         "--constant-action",
         type=float,
@@ -171,9 +171,6 @@ def reset_visual_env_down(task_name: str, env, seed: int) -> np.ndarray:
     if task_name == CARTPOLE:
         sim.state = np.asarray([0.0, np.pi - 1e-6, 0.0, 0.0], dtype=np.float32)
         return sim.state.copy()
-    if task_name == BIPEDALWALKER:
-        obs, _ = env.reset(seed=seed)
-        return np.asarray(obs, dtype=np.float32)
     if task_name == MECANUM:
         obs, _ = env.reset(seed=seed)
         return np.asarray(obs, dtype=np.float32)
@@ -217,7 +214,7 @@ def rollout(args: argparse.Namespace, model: NeuralCML, device: torch.device):
 
     real_obs = reset_visual_env_down(task_name, env, args.seed)
     initial_features = obs_to_features_from_env(task_name, real_obs, env)
-    use_feature_traj = task_name in (BIPEDALWALKER, MECANUM)
+    use_feature_traj = task_name == MECANUM
     real_traj = [initial_features if use_feature_traj else real_obs]
     model_traj = [initial_features]
     step_errors = [0.0]
@@ -275,8 +272,6 @@ def make_animation(
 ) -> FuncAnimation:
     task_name = resolve_task_name(args.task)
     if task_name == MECANUM:
-        return make_feature_animation(real_traj, model_traj, actions, args, diagnostics)
-    if task_name == BIPEDALWALKER:
         return make_feature_animation(real_traj, model_traj, actions, args, diagnostics)
 
     frames = len(real_traj)

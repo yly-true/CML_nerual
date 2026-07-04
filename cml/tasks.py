@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import math
-from typing import Optional
 
 import gymnasium as gym
 import numpy as np
@@ -13,21 +12,33 @@ from gymnasium import spaces
 
 PENDULUM = "pendulum"
 CARTPOLE = "cartpole"
-BIPEDALWALKER = "bipedalwalker"
 MECANUM = "mecanum"
-BIPEDALWALKER_DEFAULT_HULL_HEIGHT = 5.68434
+SUPPORTED_TASKS = (PENDULUM, CARTPOLE, MECANUM)
 
 TASK_ENV_IDS = {
     PENDULUM: "Pendulum-v1",
     CARTPOLE: "ContinuousCartPole-v0",
-    BIPEDALWALKER: "BipedalWalker-v3",
     MECANUM: "MecanumDrive-v0",
+}
+
+FEATURE_NAMES = {
+    PENDULUM: ["cos(theta)", "sin(theta)", "thetadot"],
+    CARTPOLE: ["x", "xdot", "cos(theta)", "sin(theta)", "thetadot"],
+    MECANUM: [
+        "vx",
+        "vy",
+        "yaw_rate",
+        "front_right_wheel_speed",
+        "front_left_wheel_speed",
+        "back_right_wheel_speed",
+        "back_left_wheel_speed",
+    ],
 }
 
 
 def resolve_task_name(task: str) -> str:
     if task not in TASK_ENV_IDS:
-        raise ValueError(f"Unsupported task: {task}")
+        raise ValueError(f"Unsupported task: {task}. Supported tasks: {', '.join(SUPPORTED_TASKS)}")
     return task
 
 
@@ -36,58 +47,21 @@ def resolve_env_id(task_name: str) -> str:
 
 
 def feature_names(task_name: str) -> list[str]:
-    if task_name == PENDULUM:
-        return ["cos(theta)", "sin(theta)", "thetadot"]
-    if task_name == CARTPOLE:
-        return ["x", "xdot", "cos(theta)", "sin(theta)", "thetadot"]
-    if task_name == BIPEDALWALKER:
-        return [
-            "hull_height",
-            "hull_angle",
-            "hull_angular_velocity",
-            "horizontal_velocity",
-            "vertical_velocity",
-            "hip_1_angle",
-            "hip_1_speed",
-            "knee_1_angle",
-            "knee_1_speed",
-            "hip_2_angle",
-            "hip_2_speed",
-            "knee_2_angle",
-            "knee_2_speed",
-        ]
-    if task_name == MECANUM:
-        return [
-            "vx",
-            "vy",
-            "yaw_rate",
-            "front_right_wheel_speed",
-            "front_left_wheel_speed",
-            "back_right_wheel_speed",
-            "back_left_wheel_speed",
-        ]
-    raise ValueError(f"Unsupported task: {task_name}")
+    resolve_task_name(task_name)
+    return FEATURE_NAMES[task_name]
 
 
 def feature_dim(task_name: str, raw_obs_dim: int) -> int:
     expected_raw_dim_by_task = {
         PENDULUM: 3,
         CARTPOLE: 4,
-        BIPEDALWALKER: 24,
         MECANUM: 7,
     }
+    resolve_task_name(task_name)
     expected_raw_dim = expected_raw_dim_by_task[task_name]
     if raw_obs_dim < expected_raw_dim:
         raise ValueError(f"{task_name} expects raw obs dim >= {expected_raw_dim}, got {raw_obs_dim}.")
-    if task_name == PENDULUM:
-        return 3
-    if task_name == CARTPOLE:
-        return 5
-    if task_name == BIPEDALWALKER:
-        return 13
-    if task_name == MECANUM:
-        return 7
-    raise ValueError(f"Unsupported task: {task_name}")
+    return len(FEATURE_NAMES[task_name])
 
 
 def obs_to_features(task_name: str, obs) -> np.ndarray:
@@ -102,8 +76,6 @@ def obs_to_features(task_name: str, obs) -> np.ndarray:
         features[..., 3] = np.sin(obs_arr[..., 1])
         features[..., 4] = obs_arr[..., 3]
         return features
-    if task_name == BIPEDALWALKER:
-        return obs_to_bipedalwalker_features(obs_arr)
     if task_name == MECANUM:
         return obs_arr
     raise ValueError(f"Unsupported task: {task_name}")
@@ -111,21 +83,8 @@ def obs_to_features(task_name: str, obs) -> np.ndarray:
 
 def obs_to_features_from_env(task_name: str, obs, env) -> np.ndarray:
     """Convert observation to model features, using env internals when needed."""
-    if task_name == BIPEDALWALKER:
-        height = float(env.unwrapped.hull.position.y)
-        return obs_to_bipedalwalker_features(np.asarray(obs, dtype=np.float32), hull_height=height)
+    _ = env
     return obs_to_features(task_name, obs)
-
-
-def obs_to_bipedalwalker_features(obs_arr: np.ndarray, hull_height: Optional[float] = None) -> np.ndarray:
-    """BipedalWalker features without lidar and foot-contact flags."""
-    body_and_first_leg = obs_arr[..., :8]
-    second_leg = obs_arr[..., 9:13]
-    if hull_height is None:
-        height = np.full(obs_arr.shape[:-1] + (1,), BIPEDALWALKER_DEFAULT_HULL_HEIGHT, dtype=np.float32)
-    else:
-        height = np.full(obs_arr.shape[:-1] + (1,), hull_height, dtype=np.float32)
-    return np.concatenate([height, body_and_first_leg, second_leg], axis=-1).astype(np.float32)
 
 
 def target_features(task_name: str, args: argparse.Namespace) -> np.ndarray:
@@ -133,14 +92,6 @@ def target_features(task_name: str, args: argparse.Namespace) -> np.ndarray:
         return np.asarray([1.0, 0.0, args.target_angular_velocity], dtype=np.float32)
     if task_name == CARTPOLE:
         return np.asarray([args.target_cart_position, 0.0, 1.0, 0.0, 0.0], dtype=np.float32)
-    if task_name == BIPEDALWALKER:
-        target = np.zeros(13, dtype=np.float32)
-        target[0] = args.target_bipedalwalker_hull_height
-        target[1] = args.target_bipedalwalker_hull_angle
-        target[2] = args.target_bipedalwalker_hull_angular_velocity
-        target[3] = args.target_bipedalwalker_horizontal_velocity
-        target[4] = args.target_bipedalwalker_vertical_velocity
-        return target
     if task_name == MECANUM:
         target = np.zeros(7, dtype=np.float32)
         target[0] = args.target_mecanum_vx
@@ -155,8 +106,6 @@ def reset_train_env(task_name: str, env, args: argparse.Namespace, seed: int | N
         return reset_pendulum_train(env, args, seed=seed)
     if task_name == CARTPOLE:
         return reset_cartpole_train(env, args, seed=seed)
-    if task_name == BIPEDALWALKER:
-        return reset_bipedalwalker_train(env, args, seed=seed)
     if task_name == MECANUM:
         return reset_mecanum_train(env, args, seed=seed)
     raise ValueError(f"Unsupported task: {task_name}")
@@ -195,16 +144,6 @@ def reset_cartpole_train(env, args: argparse.Namespace, seed: int | None = None)
     pole_ang_vel = 0.0
     sim.state = np.asarray([cart_pos, pole_angle, cart_vel, pole_ang_vel], dtype=np.float32)
     return current_obs(CARTPOLE, env)
-
-
-def reset_bipedalwalker_train(env, args: argparse.Namespace, seed: int | None = None) -> np.ndarray:
-    """Reset BipedalWalker with its default randomized initial state."""
-    _ = args
-    if seed is None:
-        obs, _ = env.reset()
-    else:
-        obs, _ = env.reset(seed=seed)
-    return np.asarray(obs, dtype=np.float32)
 
 
 def reset_mecanum_train(env, args: argparse.Namespace, seed: int | None = None) -> np.ndarray:
@@ -253,14 +192,6 @@ def format_obs(task_name: str, prefix: str, obs: np.ndarray) -> str:
             f"theta={obs_arr[1]:.4f}, "
             f"xdot={obs_arr[2]:.4f}, "
             f"thetadot={obs_arr[3]:.4f}"
-        )
-    if task_name == BIPEDALWALKER:
-        return (
-            f"{prefix}: "
-            f"hull_angle={obs_arr[0]:.4f}, "
-            f"hull_angular_velocity={obs_arr[1]:.4f}, "
-            f"horizontal_velocity={obs_arr[2]:.4f}, "
-            f"vertical_velocity={obs_arr[3]:.4f}"
         )
     if task_name == MECANUM:
         return (

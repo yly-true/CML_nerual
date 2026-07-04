@@ -26,10 +26,9 @@ from cml.cml_model import (
     plan_action_gradient_mpc,
     plan_action_random_shooting,
 )
-from cml.tasks import BIPEDALWALKER_DEFAULT_HULL_HEIGHT, feature_dim, feature_names, format_obs, obs_to_features_from_env, reset_eval_env, resolve_env_id, resolve_task_name, target_features
+from cml.tasks import SUPPORTED_TASKS, feature_dim, feature_names, format_obs, obs_to_features_from_env, reset_eval_env, resolve_env_id, resolve_task_name, target_features
 from cml.utils import get_dims, make_env, resolve_device
 
-BIPEDALWALKER_DEFAULT_OBS_COST_WEIGHTS = [2.0, 3.0, 1.0, 5.0, 2.0] + [1.0] * 8
 MECANUM_DEFAULT_OBS_COST_WEIGHTS = [5.0, 5.0, 5.0] + [0.0] * 4
 
 
@@ -37,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(description="评估连续控制任务上的 Neural CML")
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--task", choices=("pendulum", "cartpole", "bipedalwalker", "mecanum"), default="pendulum")
+    parser.add_argument("--task", choices=SUPPORTED_TASKS, default="pendulum")
     parser.add_argument("--episodes", type=int, default=1000)
     parser.add_argument("--max-steps", type=int, default=2000)
     parser.add_argument("--planner", type=str, choices=("random", "cem", "gradient"), default="random")
@@ -59,11 +58,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--target-angular-velocity", type=float, default=0.0)
     parser.add_argument("--target-cart-position", type=float, default=0.0)
-    parser.add_argument("--target-bipedalwalker-hull-height", type=float, default=BIPEDALWALKER_DEFAULT_HULL_HEIGHT)
-    parser.add_argument("--target-bipedalwalker-hull-angle", type=float, default=0.0)
-    parser.add_argument("--target-bipedalwalker-hull-angular-velocity", type=float, default=0.0)
-    parser.add_argument("--target-bipedalwalker-horizontal-velocity", type=float, default=0.0)
-    parser.add_argument("--target-bipedalwalker-vertical-velocity", type=float, default=0.0)
     parser.add_argument("--target-mecanum-vx", type=float, default=-0.5)
     parser.add_argument("--target-mecanum-vy", type=float, default=0.0)
     parser.add_argument("--target-mecanum-yaw-rate", type=float, default=0.0)
@@ -219,8 +213,6 @@ def resolve_obs_cost_weights(args: argparse.Namespace, obs_dim: int) -> list[flo
         if len(args.obs_cost_weights) != obs_dim:
             raise ValueError(f"--obs-cost-weights must contain {obs_dim} values for this task.")
         return [float(weight) for weight in args.obs_cost_weights]
-    if args.task == "bipedalwalker":
-        return BIPEDALWALKER_DEFAULT_OBS_COST_WEIGHTS[:obs_dim]
     if args.task == "mecanum":
         return MECANUM_DEFAULT_OBS_COST_WEIGHTS[:obs_dim]
     return [1.0] * obs_dim

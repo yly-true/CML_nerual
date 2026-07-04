@@ -29,7 +29,6 @@ physical_next = physical + dt * physical_dot
 ```text
 pendulum: Pendulum-v1
 cartpole: 连续力输入的经典小车-单杆倒立摆
-bipedalwalker: BipedalWalker-v3
 mecanum: MuJoCo Summit XL 麦轮底盘
 ```
 
@@ -38,7 +37,6 @@ mecanum: MuJoCo Summit XL 麦轮底盘
 ```text
 pendulum: [cos(theta), sin(theta), thetadot]
 cartpole: [x, xdot, cos(theta), sin(theta), thetadot]
-bipedalwalker: hull 高度 + 原始观测去掉 10 个 lidar 和 2 个脚接触标志后的 13 维状态
 mecanum: [vx, vy, yaw_rate, 4 个轮速]
 ```
 
@@ -77,7 +75,6 @@ runs\       checkpoint 和可视化结果，可提交到 git
 ```powershell
 python -m train.train_cml_pendulum --task pendulum --device cuda
 python -m train.train_cml_pendulum --task cartpole --device cuda
-python -m train.train_cml_pendulum --task bipedalwalker --device cuda
 python -m train.train_cml_pendulum --task mecanum --device cuda
 ```
 
@@ -89,7 +86,6 @@ python -m train.train_cml_pendulum --task cartpole --device cuda --recon-dim-wei
 
 默认训练 300000 步数据、100000 次更新，`pred_weight=1.0`、`recon_weight=1.0`、`action_norm_weight=1e-4`、`latent_norm_weight=1e-4`。
 CartPole 默认 `recon_weights=[5,1,5,5,1]`。
-BipedalWalker 默认 `recon_weights=[15,15,15,15,15,15,15,15,15,15,15,15,15]`。
 Mecanum 默认 `recon_weights=[10,10,10,2,2,2,2]`，训练数据会分段保持典型固定动作。
 
 Mecanum 的状态为 7 维：
@@ -151,16 +147,13 @@ python -m evaluate.evaluate --task pendulum --checkpoint "$ckpt" --episodes 3 --
 $ckpt = Get-ChildItem runs\ContinuousCartPole_v0 -Recurse -Filter model_100000.pt | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
 python -m evaluate.evaluate --task cartpole --checkpoint "$ckpt" --episodes 3 --device cuda --render
 
-$ckpt = Get-ChildItem runs\BipedalWalker_v3 -Recurse -Filter model_100000.pt | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
-python -m evaluate.evaluate --task bipedalwalker --checkpoint E:\CML_nerual\runs\BipedalWalker_v3\20260702_013909\model_40000.pt --episodes 3 --device cuda --render
-python -m evaluate.evaluate --task mecanum --horizon 10 --device cuda --render --checkpoint 
+python -m evaluate.evaluate --task mecanum --horizon 10 --device cuda --render --checkpoint E:\CML_nerual\runs\MecanumDrive_v0\<run>\model_100000.pt
 ```
 
 评估使用 MPC：每一步用模型预测未来 `horizon` 步，选择最优动作序列，只执行第一个动作。
 
 ```powershell
 python -m evaluate.evaluate --task cartpole --checkpoint "$ckpt" --planner cem --horizon 10 --num-sequences 2048 --device cuda --render
-python -m evaluate.evaluate --task bipedalwalker --checkpoint "$ckpt" --planner gradient --inference-mode obstraj --horizon 10 --mpc-opt-steps 32 --mpc-opt-lr 0.05 --action-cost 0.01 --action-smooth-cost 0.05 --device cuda --render
 python -m evaluate.evaluate --task cartpole --checkpoint runs\ContinuousCartPole_v0\20260629_155639\model_200000.pt --planner random --horizon 10 --num-sequences 4096 --device cuda --render --target-cart-position 0.0
 ```
 
@@ -174,7 +167,6 @@ Mecanum 评估日志会额外打印 `step_rmse` 和 `s_dot_rmse`：前者是一�
 ```powershell
 python -m visualize.visualize_model --task pendulum --show
 python -m visualize.visualize_model --task cartpole --show
-python -m visualize.visualize_model --task bipedalwalker --show
 python -m visualize.visualize_model --task mecanum --show
 python -m visualize.visualize_model --task mecanum --show --steps 300 --action-mode constant --constant-action 0.5 0.5 0.5 0.5
 ```
@@ -187,7 +179,6 @@ python -m visualize.visualize_model --task cartpole --checkpoint "$ckpt" --show
 ```
 
 Pendulum 会显示角度、角速度和动作；CartPole 会显示角度、小车位置和动作。
-BipedalWalker 会显示观测维度的 one-step 预测曲线和 4 维动作曲线。
 Mecanum 使用 MuJoCo 官方窗口渲染小车运动，同时显示 `[vx, vy, yaw_rate, 4 个轮速]` 的 one-step 预测曲线和 4 维动作曲线。动画左上角会显示 `one_step_error`、`step_rmse`，如果 checkpoint 是 `obs_derivative` 模式，还会显示 `s_dot_rmse`。
 
 保存 GIF：
