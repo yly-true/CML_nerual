@@ -25,9 +25,9 @@ FEATURE_NAMES = {
     PENDULUM: ["cos(theta)", "sin(theta)", "thetadot"],
     CARTPOLE: ["x", "xdot", "cos(theta)", "sin(theta)", "thetadot"],
     MECANUM: [
-        "vx",
-        "vy",
-        "yaw_rate",
+        "body_vx",
+        "body_vy",
+        "body_yaw_rate",
         "front_right_wheel_speed",
         "front_left_wheel_speed",
         "back_right_wheel_speed",
@@ -196,9 +196,9 @@ def format_obs(task_name: str, prefix: str, obs: np.ndarray) -> str:
     if task_name == MECANUM:
         return (
             f"{prefix}: "
-            f"vx={obs_arr[0]:.4f}, "
-            f"vy={obs_arr[1]:.4f}, "
-            f"yaw_rate={obs_arr[2]:.4f}"
+            f"body_vx={obs_arr[0]:.4f}, "
+            f"body_vy={obs_arr[1]:.4f}, "
+            f"body_yaw_rate={obs_arr[2]:.4f}"
         )
     raise ValueError(f"Unsupported task: {task_name}")
 

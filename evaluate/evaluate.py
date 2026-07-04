@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -61,6 +62,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-mecanum-vx", type=float, default=-0.5)
     parser.add_argument("--target-mecanum-vy", type=float, default=0.0)
     parser.add_argument("--target-mecanum-yaw-rate", type=float, default=0.0)
+    parser.add_argument(
+        "--mecanum-target-sequence",
+        type=str,
+        default=None,
+        help="JSON list of mecanum body-frame targets, each [body_vx, body_vy, body_yaw_rate] or full 7D target.",
+    )
+    parser.add_argument("--mecanum-target-duration", type=float, default=2.0, help="Seconds per mecanum target.")
+    parser.add_argument("--mecanum-target-loop", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--initial-cart-position", type=float, default=None, help="CartPole initial x. Defaults to 0 when any CartPole initial option is set.")
     parser.add_argument("--initial-cart-velocity", type=float, default=None, help="CartPole initial xdot. Defaults to 0 when any CartPole initial option is set.")
     parser.add_argument("--initial-pole-angle", type=float, default=None, help="CartPole initial theta in radians. Defaults to 0 when any CartPole initial option is set.")
@@ -216,6 +225,59 @@ def resolve_obs_cost_weights(args: argparse.Namespace, obs_dim: int) -> list[flo
     if args.task == "mecanum":
         return MECANUM_DEFAULT_OBS_COST_WEIGHTS[:obs_dim]
     return [1.0] * obs_dim
+
+
+def parse_mecanum_target_sequence(args: argparse.Namespace) -> np.ndarray | None:
+    """Parse optional JSON target sequence into full 7D mecanum feature targets."""
+    if args.mecanum_target_sequence is None:
+        return None
+
+    raw_targets = json.loads(args.mecanum_target_sequence)
+    if not isinstance(raw_targets, list) or len(raw_targets) == 0:
+        raise ValueError("--mecanum-target-sequence must be a non-empty JSON list.")
+
+    targets = []
+    for raw_target in raw_targets:
+        values = np.asarray(raw_target, dtype=np.float32)
+        if values.shape == (3,):
+            target = np.zeros(7, dtype=np.float32)
+            target[:3] = values
+        elif values.shape == (7,):
+            target = values.astype(np.float32)
+        else:
+            raise ValueError("Each mecanum target must contain either 3 values or 7 values.")
+        targets.append(target)
+
+    if args.mecanum_target_duration <= 0:
+        raise ValueError("--mecanum-target-duration must be positive.")
+    return np.stack(targets, axis=0)
+
+
+def eval_control_dt(task_name: str, env) -> float:
+    """Return one evaluation control-step duration in seconds."""
+    if task_name == "mecanum":
+        sim = env.unwrapped
+        return float(sim.model.opt.timestep) * float(sim.frame_skip)
+    return 0.05
+
+
+def scheduled_target_features(
+    task_name: str,
+    args: argparse.Namespace,
+    step_idx: int,
+    control_dt: float,
+) -> np.ndarray:
+    """Return the target active at the current evaluation step."""
+    if task_name != "mecanum" or args.mecanum_target_sequence_array is None:
+        return target_features(task_name, args)
+
+    target_count = len(args.mecanum_target_sequence_array)
+    target_idx = int((step_idx * control_dt) // args.mecanum_target_duration)
+    if args.mecanum_target_loop:
+        target_idx %= target_count
+    else:
+        target_idx = min(target_idx, target_count - 1)
+    return args.mecanum_target_sequence_array[target_idx]
 
 
 def maybe_render(env, args: argparse.Namespace) -> None:
@@ -432,6 +494,7 @@ def run_episode(
     task_name: str,
     args: argparse.Namespace,
     device: torch.device,
+    control_dt: float,
 ) -> tuple[float, int]:
     """执行一条评估 episode。"""
     obs = reset_env_to_initial_state(task_name, env, args)
@@ -449,7 +512,7 @@ def run_episode(
             obs_features = obs_to_features_from_env(task_name, obs, env)
             obs_t = torch.as_tensor(obs_features.astype(np.float32), dtype=torch.float32, device=device)
 
-            goal_features = target_features(task_name, args)
+            goal_features = scheduled_target_features(task_name, args, ep_len, control_dt)
             goal_t = torch.as_tensor(goal_features.astype(np.float32), dtype=torch.float32, device=device)
 
             action_t = plan_action_mpc(
@@ -468,7 +531,7 @@ def run_episode(
             ep_return += float(reward)
             ep_len += 1
             if args.log_every > 0 and ep_len % args.log_every == 0:
-                target = target_features(task_name, args)
+                target = scheduled_target_features(task_name, args, ep_len, control_dt)
                 diag_text = ", ".join(f"{name}={value:.4f}" for name, value in diagnostics.items())
                 print(f"{format_obs(task_name, 'obs', obs)}, target={target}, {diag_text}")
 
@@ -484,6 +547,7 @@ def run_episode(
 def main() -> None:
     args = parse_args()
     task_name = resolve_task_name(args.task)
+    args.mecanum_target_sequence_array = parse_mecanum_target_sequence(args)
     env_id = resolve_env_id(task_name)
     device = resolve_device(args.device)
     render_mode = "human" if args.render else None
@@ -492,6 +556,7 @@ def main() -> None:
     expected_obs_dim = feature_dim(task_name, raw_obs_dim)
     model = load_model(args, expected_obs_dim, action_dim, device)
     planner_inputs = prepare_planner_inputs(env, expected_obs_dim, device, args)
+    control_dt = eval_control_dt(task_name, env)
 
     print(
         "inference: "
@@ -504,7 +569,13 @@ def main() -> None:
         f"cem_iterations={args.cem_iterations}, cem_elite_frac={args.cem_elite_frac}, "
         f"mpc_opt_steps={args.mpc_opt_steps}, mpc_opt_lr={args.mpc_opt_lr}"
     )
-    print(f"target: {target_features(task_name, args)}")
+    print(f"target: {scheduled_target_features(task_name, args, 0, control_dt)}")
+    if task_name == "mecanum" and args.mecanum_target_sequence_array is not None:
+        print(
+            "target_sequence: "
+            f"duration={args.mecanum_target_duration}s, loop={args.mecanum_target_loop}, "
+            f"control_dt={control_dt:.4f}s, targets={args.mecanum_target_sequence_array.tolist()}"
+        )
     if args.render:
         print(
             f"render: render_every={args.render_every}, render_sleep={args.render_sleep}, "
@@ -521,6 +592,7 @@ def main() -> None:
             task_name=task_name,
             args=args,
             device=device,
+            control_dt=control_dt,
         )
 
         returns.append(ep_return)

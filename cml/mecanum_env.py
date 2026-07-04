@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -62,6 +63,22 @@ class MecanumDriveEnv(gym.Env):
         )
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.model.nu,), dtype=np.float32)
 
+    def _base_planar_velocity_body(self) -> np.ndarray:
+        """Return planar base velocity in the robot body frame."""
+        qpos = self.data.qpos
+        qvel = self.data.qvel
+        quat = qpos[3:7]
+        w, x, y, z = [float(value) for value in quat]
+        yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        vx_world = float(qvel[0])
+        vy_world = float(qvel[1])
+        vx_body = cos_yaw * vx_world + sin_yaw * vy_world
+        vy_body = -sin_yaw * vx_world + cos_yaw * vy_world
+        yaw_rate_body = float(qvel[5])
+        return np.asarray([vx_body, vy_body, yaw_rate_body], dtype=np.float32)
+
     def _get_obs(self) -> np.ndarray:
         qvel = self.data.qvel
         wheel_vel = np.asarray(
@@ -73,7 +90,7 @@ class MecanumDriveEnv(gym.Env):
             ],
             dtype=np.float32,
         )
-        base_vel = np.asarray([qvel[0], qvel[1], qvel[5]], dtype=np.float32)
+        base_vel = self._base_planar_velocity_body()
         return np.concatenate([base_vel, wheel_vel]).astype(np.float32)
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
