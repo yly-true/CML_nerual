@@ -12,7 +12,7 @@ import torch.nn.functional as F
 CML_LATENT_DIM = 256
 CML_HIDDEN_DIMS = [128, 128]
 CML_NETWORK_TYPE = "mlp"
-CML_DYNAMICS_MODE = "latent"
+CML_DYNAMICS_MODE = "obs_derivative"
 CML_DERIVATIVE_DT = 0.02
 CML_SNN_TIMESTEPS = 16
 CML_SNN_TAU = 2.0
@@ -167,16 +167,14 @@ class CMLLossOutput:
 
 
 class NeuralCML(nn.Module):
-    """受 CML 启发的 latent dynamics 模型。
+    """连续动力学模型。
 
-    对于观测 o_t 和动作 a_t：
+    新训练统一使用直接导数形式：
 
-        s_t = encoder(o_t)
-        delta_t = action_encoder([o_t, a_t])
-        s_next_hat = s_t + delta_t
+        s_dot = f(s_t, a_t)
+        s_next = s_t + dt * s_dot
 
-    这里保留了论文里“动作在状态空间中对应位移”的核心想法，
-    同时让动作位移依赖当前 latent state，以适配连续控制任务。
+    旧的 latent 分支仅保留用于历史 checkpoint 兼容。
     """
 
     def __init__(
@@ -339,10 +337,10 @@ class NeuralCML(nn.Module):
     ) -> CMLLossOutput:
         """计算训练损失。
 
-        包含三部分：
-        1. latent 下一状态预测误差
-        2. 观测重建误差
-        3. action delta 的范数正则
+        obs_derivative 模式包含：
+        1. 欧拉积分后的一步状态误差
+        2. 直接导数误差
+        3. 导数幅值和状态幅值正则
         """
         if self.dynamics_mode == "obs_derivative":
             state, next_obs_hat = self.forward(obs, action)
@@ -365,6 +363,7 @@ class NeuralCML(nn.Module):
             )
             return CMLLossOutput(total, pred, recon, recon, continuity, action_norm, latent_norm)
 
+        # Compatibility path for historical latent checkpoints.
         state, next_state_hat = self.forward(obs, action)
         with torch.no_grad():
             next_state_target = self.encode(next_obs)

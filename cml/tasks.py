@@ -21,6 +21,12 @@ TASK_ENV_IDS = {
     MECANUM: "MecanumDrive-v0",
 }
 
+TASK_DERIVATIVE_DT = {
+    PENDULUM: 0.05,
+    CARTPOLE: 0.05,
+    MECANUM: 0.02,
+}
+
 FEATURE_NAMES = {
     PENDULUM: ["cos(theta)", "sin(theta)", "thetadot"],
     CARTPOLE: ["x", "xdot", "cos(theta)", "sin(theta)", "thetadot"],
@@ -44,6 +50,11 @@ def resolve_task_name(task: str) -> str:
 
 def resolve_env_id(task_name: str) -> str:
     return TASK_ENV_IDS[task_name]
+
+
+def derivative_dt(task_name: str) -> float:
+    resolve_task_name(task_name)
+    return TASK_DERIVATIVE_DT[task_name]
 
 
 def feature_names(task_name: str) -> list[str]:

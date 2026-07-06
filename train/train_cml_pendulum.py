@@ -2,7 +2,7 @@
 
 整体流程分两步：
 1. 随机探索采集转移数据
-2. 用自监督方式学习 latent 动力学
+2. 用自监督方式学习连续时间状态导数
 """
 
 from __future__ import annotations
@@ -20,8 +20,6 @@ from torch import optim
 from tqdm import trange
 
 from cml.cml_model import (
-    CML_DERIVATIVE_DT,
-    CML_DYNAMICS_MODE,
     CML_NETWORK_TYPE,
     CML_SNN_SURROGATE_SCALE,
     CML_SNN_TAU,
@@ -30,7 +28,7 @@ from cml.cml_model import (
     NeuralCML,
 )
 from cml.replay_buffer import ReplayBuffer
-from cml.tasks import SUPPORTED_TASKS, feature_dim, obs_to_features_from_env, reset_train_env, resolve_env_id, resolve_task_name
+from cml.tasks import SUPPORTED_TASKS, derivative_dt, feature_dim, obs_to_features_from_env, reset_train_env, resolve_env_id, resolve_task_name
 from cml.utils import (
     get_dims,
     make_env,
@@ -61,8 +59,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-norm-weight", type=float, default=1e-4)
     parser.add_argument("--latent-norm-weight", type=float, default=1e-4)
     parser.add_argument("--network-type", choices=("snn", "mlp"), default=CML_NETWORK_TYPE)
-    parser.add_argument("--dynamics-mode", choices=("auto", "latent", "obs_derivative"), default="auto")
-    parser.add_argument("--derivative-dt", type=float, default=CML_DERIVATIVE_DT)
+    parser.add_argument("--dynamics-mode", choices=("auto", "obs_derivative"), default="auto")
+    parser.add_argument("--derivative-dt", type=float, default=None, help="Defaults to the task control dt.")
     parser.add_argument("--snn-timesteps", type=int, default=CML_SNN_TIMESTEPS)
     parser.add_argument("--snn-tau", type=float, default=CML_SNN_TAU)
     parser.add_argument("--snn-threshold", type=float, default=CML_SNN_THRESHOLD)
@@ -147,7 +145,7 @@ def build_model(args: argparse.Namespace, obs_dim: int, action_dim: int, device:
     """按参数构造模型并放到目标设备上。"""
     dynamics_mode = args.dynamics_mode
     if dynamics_mode == "auto":
-        dynamics_mode = "obs_derivative" if args.task == "mecanum" else CML_DYNAMICS_MODE
+        dynamics_mode = "obs_derivative"
     derivative_dim = obs_dim
     return NeuralCML(
         obs_dim=obs_dim,
@@ -183,10 +181,11 @@ def print_model_size(model: NeuralCML, obs_dim: int, action_dim: int) -> None:
     """打印当前网络参数，确认 cml_model.py 中的配置已生效。"""
     total_params = sum(param.numel() for param in model.parameters())
     param_mb = sum(param.numel() * param.element_size() for param in model.parameters()) / 1024 / 1024
+    state_label = "state_dim" if model.dynamics_mode == "obs_derivative" else "latent_dim"
     print(
         "Model size: "
         f"obs_dim={obs_dim}, action_dim={action_dim}, "
-        f"latent_dim={model.latent_dim}, hidden_dims={list(model.hidden_dims)}, "
+        f"{state_label}={model.latent_dim}, hidden_dims={list(model.hidden_dims)}, "
         f"network_type={model.network_type}, dynamics_mode={model.dynamics_mode}, "
         f"derivative_dt={model.derivative_dt}, derivative_dim={model.derivative_dim}, "
         f"snn_timesteps={model.snn_timesteps}, "
@@ -228,8 +227,8 @@ def apply_checkpoint_model_args(args: argparse.Namespace, checkpoint_path: Path 
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     saved_args = ckpt.get("args", {})
     args.network_type = saved_args.get("network_type", "mlp")
-    args.dynamics_mode = saved_args.get("dynamics_mode", "latent")
-    args.derivative_dt = float(saved_args.get("derivative_dt", CML_DERIVATIVE_DT))
+    args.dynamics_mode = saved_args.get("dynamics_mode", "obs_derivative")
+    args.derivative_dt = float(saved_args.get("derivative_dt", derivative_dt(args.task)))
     args.snn_timesteps = int(saved_args.get("snn_timesteps", CML_SNN_TIMESTEPS))
     args.snn_tau = float(saved_args.get("snn_tau", CML_SNN_TAU))
     args.snn_threshold = float(saved_args.get("snn_threshold", CML_SNN_THRESHOLD))
@@ -322,6 +321,8 @@ def prepare_dataset(args: argparse.Namespace):
     """创建环境并采样训练数据。"""
     args.task = resolve_task_name(args.task)
     args.env_id = resolve_env_id(args.task)
+    if args.derivative_dt is None:
+        args.derivative_dt = derivative_dt(args.task)
     env = make_env(args.env_id)
     raw_obs_dim, action_dim = get_dims(env)
     obs_dim = feature_dim(args.task, raw_obs_dim)

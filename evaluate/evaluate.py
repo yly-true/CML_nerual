@@ -77,12 +77,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--initial-pendulum-angle", type=float, default=None, help="Pendulum initial theta in radians. Defaults to env reset.")
     parser.add_argument("--initial-pendulum-angular-velocity", type=float, default=0.0, help="Pendulum initial thetadot when --initial-pendulum-angle is set.")
     parser.add_argument(
-        
         "--inference-mode",
         type=str,
-        choices=("obsend", "obstraj", "latentend", "latenttraj"),
+        choices=("obsend", "obstraj"),
         default="obsend",
-                        help="MPC objective: obsend, obstraj, latentend, or latenttraj.",
+        help="MPC objective: obsend or obstraj.",
     )
     parser.add_argument(
         "--obs-cost-weights",
@@ -105,8 +104,6 @@ def objective_from_inference_mode(inference_mode: str) -> str:
     objective_by_mode = {
         "obsend": "obs-terminal",
         "obstraj": "obs-trajectory",
-        "latentend": "latent-terminal",
-        "latenttraj": "latent-trajectory",
     }
     return objective_by_mode[inference_mode]
 
@@ -116,10 +113,11 @@ def print_model_size(model: NeuralCML, model_args: dict, obs_dim: int, action_di
     total_params = sum(param.numel() for param in model.parameters())
     trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
     param_mb = sum(param.numel() * param.element_size() for param in model.parameters()) / 1024 / 1024
+    state_label = "state_dim" if model_args["dynamics_mode"] == "obs_derivative" else "latent_dim"
     print(
         "Model size: "
         f"obs_dim={obs_dim}, action_dim={action_dim}, "
-        f"latent_dim={model_args['latent_dim']}, hidden_dims={model_args['hidden_dims']}, "
+        f"{state_label}={model_args['latent_dim']}, hidden_dims={model_args['hidden_dims']}, "
         f"network_type={model_args['network_type']}, dynamics_mode={model_args['dynamics_mode']}, "
         f"derivative_dt={model_args['derivative_dt']}, derivative_dim={model_args['derivative_dim']}, "
         f"snn_timesteps={model_args['snn_timesteps']}, "
