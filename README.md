@@ -162,7 +162,7 @@ python -m evaluate.evaluate --task mecanum --horizon 10 --device cuda --render -
 每个目标可以写 3 维 `[body_vx, body_vy, body_yaw_rate]`，也可以写完整 7 维 `[body_vx, body_vy, body_yaw_rate, wheel0, wheel1, wheel2, wheel3]`。如果要改每个目标持续时间：
 
 ```powershell
-python -m evaluate.evaluate --task mecanum --checkpoint E:\CML_nerual\runs\MecanumDrive_v0\<run>\model_100000.pt --mecanum-target-sequence "[[0.5,0,0],[0,0.5,0]]" --mecanum-target-duration 3.0
+python -m evaluate.evaluate --task mecanum --checkpoint E:\CML_nerual\runs\MecanumDrive_v0\<run>\model_100000.pt --mecanum-target-sequence "[[2.0,0,0],[0,0.5,0]]" --mecanum-target-duration 3.0
 ```
 
 ```powershell
