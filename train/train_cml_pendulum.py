@@ -40,7 +40,7 @@ from cml.utils import (
 
 
 DEFAULT_CARTPOLE_RECON_WEIGHTS = [5.0, 1.0, 5.0, 5.0, 1.0]
-DEFAULT_MECANUM_RECON_WEIGHTS = [10.0, 10.0, 10.0] + [2.0] * 4
+DEFAULT_MECANUM_RECON_WEIGHTS = [10.0, 10.0, 20.0] + [2.0] * 4
 
 
 def parse_args() -> argparse.Namespace:

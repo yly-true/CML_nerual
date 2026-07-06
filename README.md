@@ -86,7 +86,7 @@ python -m train.train_cml_pendulum --task cartpole --device cuda --recon-dim-wei
 
 默认训练 300000 步数据、100000 次更新，`pred_weight=1.0`、`recon_weight=1.0`、`action_norm_weight=1e-4`、`latent_norm_weight=1e-4`。
 CartPole 默认 `recon_weights=[5,1,5,5,1]`。
-Mecanum 默认 `recon_weights=[10,10,10,2,2,2,2]`，训练数据会分段保持典型固定动作。
+Mecanum 默认 `recon_weights=[10,10,20,2,2,2,2]`，训练数据会分段保持典型固定动作。
 
 Mecanum 的状态为 7 维：
 
@@ -205,8 +205,8 @@ python -m visualize.visualize_model --task cartpole --checkpoint "$ckpt" --outpu
 在 `cml\cml_model.py` 顶部修改：
 
 ```python
-CML_LATENT_DIM = 16
-CML_HIDDEN_DIMS = [64, 64]
+CML_LATENT_DIM = 256
+CML_HIDDEN_DIMS = [128, 128]
 CML_NETWORK_TYPE = "mlp"
 CML_SNN_TIMESTEPS = 16
 CML_SNN_TAU = 2.0
@@ -214,13 +214,27 @@ CML_SNN_THRESHOLD = 0.5
 ```
 
 `CML_HIDDEN_DIMS` 中每个数字对应一层隐藏层宽度。
-当前默认配置为 `latent_dim=16`、`hidden_dims=[64, 64]`、`network_type=mlp`。
+当前默认配置为 `latent_dim=256`、`hidden_dims=[128, 128]`、`network_type=mlp`。
 MLP 每个隐藏层使用 `Linear -> ReLU`，输出层为 Linear。
 训练时也可以通过命令行临时切到 SNN：
 
 ```powershell
 python -m train.train_cml_pendulum --task cartpole --network-type snn --device cuda
 ```
+
+Mecanum 的 SNN 训练命令：
+
+```powershell
+python -m train.train_cml_pendulum --task mecanum --network-type snn --snn-timesteps 8 --updates 30000 --device cuda
+```
+
+如果 30000 次更新收敛正常，再跑更完整的训练：
+
+```powershell
+python -m train.train_cml_pendulum --task mecanum --network-type snn --snn-timesteps 16 --updates 100000 --device cuda
+```
+
+Mecanum 的 SNN 仍然使用 `obs_derivative` 动力学形式，网络输入是 `[body_vx, body_vy, body_yaw_rate, 4 个轮速, 4 个动作]`，输出是连续的 `s_dot`。隐藏层是 `Linear -> LIF -> Linear -> LIF`，最后一层是连续 readout，不是离散 spike 输出。由于 Mecanum 状态已经改为机体系速度，旧 checkpoint 不能直接对比，需要重新训练。
 
 CUDA 训练默认开启 AMP 混合精度以加速；如需关闭：
 

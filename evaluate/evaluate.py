@@ -77,6 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--initial-pendulum-angle", type=float, default=None, help="Pendulum initial theta in radians. Defaults to env reset.")
     parser.add_argument("--initial-pendulum-angular-velocity", type=float, default=0.0, help="Pendulum initial thetadot when --initial-pendulum-angle is set.")
     parser.add_argument(
+        
         "--inference-mode",
         type=str,
         choices=("obsend", "obstraj", "latentend", "latenttraj"),
